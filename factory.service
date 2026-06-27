@@ -1,0 +1,26 @@
+# systemd unit for the factory daemon (headless, always-on).
+# Install:
+#   cp factory.service ~/.config/systemd/user/factory.service   # edit paths first
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now factory
+#   journalctl --user -u factory -f        # follow logs
+#
+# Requires `loginctl enable-linger $USER` so it runs without an active session.
+
+[Unit]
+Description=factory — autonomous ticket->PR agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/factory
+EnvironmentFile=%h/Projects/factory/.env
+ExecStart=%h/Projects/factory/run.sh
+Restart=on-failure
+RestartSec=15
+# factory drives `claude`, `printer`, `git`, and `gh`; keep the user PATH.
+Environment=PATH=%h/.local/bin:%h/.nvm/versions/node/v24.15.0/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
