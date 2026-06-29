@@ -35,6 +35,8 @@ Linear OAuth session) — the daemon never stores Linear credentials.
 | Git | `tools/gitops.py` | branch / commit spec / commit work / push |
 | Printer | `tools/printer.py` | run `printer exec`, classify success/blocked |
 | Spec generation | `tools/specgen.py` | `claude -p`: request → printer checklist spec |
+| Self-improvement | `selfimprove.py` | run printer on factory's **own** source → build → commit → restart |
+| Build / restart | `tools/selfupdate.py` | compile+import build gate; `supervisorctl restart` |
 
 ## Setup
 
@@ -62,8 +64,56 @@ Linear OAuth session) — the daemon never stores Linear credentials.
 FACTORY_DRY_RUN=1 ./run.sh --once   # log intended actions, mutate nothing
 ```
 
-Headless / always-on via systemd: see `factory.service` (edit paths, then
-`systemctl --user enable --now factory`).
+Headless / always-on, two options:
+
+- **supervisord** (`supervisord.conf`) — **required for self-improvement**, since
+  factory restarts itself via `supervisorctl`:
+  ```sh
+  pip install --user supervisor          # or pipx install supervisor
+  supervisord -c supervisord.conf        # start in the background
+  supervisorctl -c supervisord.conf status
+  supervisorctl -c supervisord.conf tail -f factory
+  ```
+- **systemd** (`factory.service`) — plain always-on without self-restart (edit
+  paths, then `systemctl --user enable --now factory`).
+
+## Self-improvement
+
+factory can improve a second "code directory": **its own source**. Any trigger
+(Linear ticket or email) whose **title starts with the self marker** (default
+`[self]`) is routed away from the customer repo and instead:
+
+```
+[self] request ─▶ spec ─▶ printer exec (on factory's source) ─▶ build ─▶ commit ─▶ restart
+                                                                   │
+                                                          (build fails → roll back, don't restart)
+```
+
+1. `printer exec` runs against `FACTORY_SELF_PATH` (factory's own checkout).
+2. **build gate** (`tools/selfupdate.py`): byte-compile every module + import the
+   entry points in a fresh interpreter. This must pass before anything is kept.
+3. on success: commit on the running branch (and push if `FACTORY_SELF_PUSH=1`),
+   report back (Linear comment / email reply), then **restart via supervisor** so
+   the new code runs.
+4. on failure (printer blocked or build broken): the working tree is rolled back
+   (`git reset --hard` + `git clean -fd`, leaving git-ignored `.env` untouched)
+   and factory is **not** restarted.
+
+Self-updates happen on the *running branch* (not a throwaway PR branch) because a
+restart redeploys the working tree — the build gate, not code review, is the
+safety net. Enable pushes/PRs with `FACTORY_SELF_PUSH=1` if you also want the
+change on `origin`.
+
+Trigger it manually too (no ticket needed):
+
+```sh
+./selfimprove.py "add a --status flag to factoryd"
+./selfimprove.py "rework retries" --body-file note.md --no-restart   # apply+build only
+echo "switch to JSON logging" | ./selfimprove.py "json logs" --body -
+./selfimprove.py --build-only        # just run the build gate
+./selfimprove.py --restart-only      # just restart via supervisor
+./selfimprove.py --status            # supervisor status for factory
+```
 
 ## Triggers & dedup
 

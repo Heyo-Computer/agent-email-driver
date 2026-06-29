@@ -105,6 +105,16 @@ class Config:
     agent_model: str
     printer_max_turns: int
 
+    # Self-improvement (factory editing its own source via printer)
+    factory_self_path: Path        # factory's own checkout (defaults to this dir)
+    self_marker: str               # request-title prefix that routes to self-update
+    self_specs_dir: str            # spec dir under factory_self_path
+    self_push: bool                # also push self changes to origin after build
+    self_restart: bool             # restart via supervisor after a good self-update
+    supervisorctl_bin: str         # supervisorctl binary
+    supervisor_conf: str | None    # -c <conf> for supervisorctl (defaults to ./supervisord.conf)
+    supervisor_program: str        # program name supervisord runs factory under
+
     @property
     def linear_enabled(self) -> bool:
         return bool(self.linear_team)
@@ -152,4 +162,17 @@ class Config:
             printer_bin=_env("FACTORY_PRINTER_BIN", "printer"),
             agent_model=_env("FACTORY_AGENT_MODEL", "opus"),
             printer_max_turns=int(_env("FACTORY_PRINTER_MAX_TURNS", "40")),
+            factory_self_path=Path(
+                _env("FACTORY_SELF_PATH", str(HERE))
+            ).expanduser().resolve(),
+            self_marker=_env("FACTORY_SELF_MARKER", "[self]"),
+            self_specs_dir=_env("FACTORY_SELF_SPECS_DIR", "specs"),
+            self_push=_env("FACTORY_SELF_PUSH", "") not in ("", "0", "false", "no"),
+            self_restart=_env("FACTORY_SELF_RESTART", "1")
+            not in ("0", "false", "no"),
+            supervisorctl_bin=_env("FACTORY_SUPERVISORCTL_BIN", "supervisorctl"),
+            supervisor_conf=_env(
+                "FACTORY_SUPERVISOR_CONF", str(HERE / "supervisord.conf")
+            ),
+            supervisor_program=_env("FACTORY_SUPERVISOR_PROGRAM", "factory"),
         )

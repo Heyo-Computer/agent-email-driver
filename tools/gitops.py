@@ -13,9 +13,12 @@ from util import Result, log, run
 
 
 class Git:
-    def __init__(self, cfg):
+    def __init__(self, cfg, repo: Path | None = None):
+        # `repo` overrides the working tree git acts on. Defaults to the customer
+        # repo; the self-improvement path passes `cfg.factory_self_path` so the
+        # same helpers can operate on factory's own checkout.
         self.cfg = cfg
-        self.repo = cfg.repo_path
+        self.repo = repo or cfg.repo_path
 
     def _git(self, args: list[str], timeout: int = 120) -> Result:
         return run(["git", *args], cwd=self.repo, timeout=timeout)
@@ -96,3 +99,34 @@ class Git:
 
     def has_uncommitted(self) -> bool:
         return bool(self._git(["status", "--porcelain"]).out.strip())
+
+    # --- self-update support: snapshot / rollback the running checkout ----------
+
+    def current_branch(self) -> str:
+        """Name of the currently checked-out branch (empty if detached)."""
+        res = self._git(["rev-parse", "--abbrev-ref", "HEAD"])
+        name = res.out.strip()
+        return "" if name in ("", "HEAD") else name
+
+    def head(self) -> str | None:
+        """Current commit sha, for snapshot/rollback. None if not a repo."""
+        res = self._git(["rev-parse", "HEAD"])
+        return res.out.strip() if res.ok else None
+
+    def reset_hard(self, ref: str) -> bool:
+        """Discard tracked changes back to `ref` (used to roll back a bad self-update)."""
+        if self.cfg.dry_run:
+            log.info("[dry-run] would git reset --hard %s", ref)
+            return True
+        return self._git(["reset", "--hard", ref]).ok
+
+    def clean_untracked(self) -> bool:
+        """Remove untracked files/dirs (NOT git-ignored ones, so `.env` is safe).
+
+        Pairs with `reset_hard` to fully revert a failed self-update — including
+        any new files `printer` created — without touching ignored secrets/caches.
+        """
+        if self.cfg.dry_run:
+            log.info("[dry-run] would git clean -fd (keeping ignored files)")
+            return True
+        return self._git(["clean", "-fd"]).ok

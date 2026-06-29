@@ -23,9 +23,12 @@ class ExecOutcome:
 
 
 class Printer:
-    def __init__(self, cfg):
+    def __init__(self, cfg, repo: Path | None = None):
+        # `repo` overrides the target working directory. It defaults to the
+        # customer repo (`cfg.repo_path`); the self-improvement path points it
+        # at factory's own source (`cfg.factory_self_path`).
         self.cfg = cfg
-        self.repo = cfg.repo_path
+        self.repo = repo or cfg.repo_path
 
     def exec_spec(self, spec_path: Path, *, resume: bool = False) -> ExecOutcome:
         """Run `printer exec` for a spec. Long-running; no wall-clock timeout."""

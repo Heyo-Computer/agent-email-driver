@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 factory.log
+
+# supervisor runtime (socket, pid, logs) — keep the dir, ignore its contents
+.supervisor/*
+!.supervisor/.gitkeep

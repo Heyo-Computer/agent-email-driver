@@ -20,6 +20,7 @@ import time
 
 from config import Config
 from pipeline import Pipeline, WorkItem
+from selfimprove import SelfImprover
 from tools.gh import Gh
 from tools.gitops import Git
 from tools.inbox import Inbox
@@ -54,19 +55,38 @@ class Factory:
             inbox=self.inbox,
             notifier=self.notifier,
         )
+        # Same reporting channels, but edits factory's own source instead of the
+        # customer repo. Used for items whose title carries the self marker.
+        self.self_improver = SelfImprover(
+            cfg, linear=self.linear, inbox=self.inbox, notifier=self.notifier
+        )
+
+    def _classify_target(self, title: str) -> tuple[str, str]:
+        """Route by the self marker. Returns (target, cleaned_title).
+
+        A leading `cfg.self_marker` (default `[self]`, case-insensitive) on the
+        title routes the item to self-improvement, with the marker stripped from
+        the title that becomes the spec.
+        """
+        marker = self.cfg.self_marker
+        if marker and title.strip().lower().startswith(marker.lower()):
+            return "self", title.strip()[len(marker):].strip() or title.strip()
+        return "repo", title
 
     def collect(self) -> list[WorkItem]:
         items: list[WorkItem] = []
         if self.cfg.linear_enabled:
             try:
                 for iss in self.linear.list_trigger_issues():
+                    target, title = self._classify_target(iss.title)
                     items.append(
                         WorkItem(
                             source="linear",
-                            title=iss.title,
+                            title=title,
                             body=iss.description,
                             ref=iss.id,
                             identifier=iss.identifier,
+                            target=target,
                         )
                     )
             except Exception as e:  # noqa: BLE001
@@ -74,14 +94,16 @@ class Factory:
         if self.cfg.imap_enabled:
             try:
                 for t in self.inbox.fetch_triggers():
+                    target, title = self._classify_target(t.subject)
                     items.append(
                         WorkItem(
                             source="email",
-                            title=t.subject,
+                            title=title,
                             body=t.body,
                             ref=t.uid,
                             reply_to=t.sender,
                             reply_msgid=t.message_id,
+                            target=target,
                         )
                     )
             except Exception as e:  # noqa: BLE001
@@ -94,7 +116,10 @@ class Factory:
             if _stop:
                 break
             try:
-                self.pipeline.process(item)
+                if item.target == "self":
+                    self.self_improver.process(item)
+                else:
+                    self.pipeline.process(item)
             except Exception as e:  # noqa: BLE001 - one bad item must not kill the loop
                 log.exception("unhandled error on %s '%s': %s",
                               item.source, item.title, e)

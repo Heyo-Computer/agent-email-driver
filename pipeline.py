@@ -23,6 +23,7 @@ class WorkItem:
     identifier: str = ""   # linear ENG-123 (for branch/state ops); "" for email
     reply_to: str = ""     # email sender address (email source only)
     reply_msgid: str = ""  # email Message-ID for threading (email source only)
+    target: str = "repo"   # "repo" (customer pipeline) | "self" (self-improvement)
 
 
 class Pipeline:
