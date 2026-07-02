@@ -89,6 +89,8 @@ class Config:
     imap_pass: str | None
     imap_folder: str
     imap_allowed_senders: list[str]
+    imap_require_directive: bool
+    imap_directive_markers: list[str]
 
     # SMTP (notifications)
     smtp_host: str | None
@@ -150,6 +152,10 @@ class Config:
             imap_pass=_env("FACTORY_IMAP_PASS"),
             imap_folder=_env("FACTORY_IMAP_FOLDER", "INBOX"),
             imap_allowed_senders=_csv("FACTORY_IMAP_ALLOWED_SENDERS"),
+            imap_require_directive=_env("FACTORY_IMAP_REQUIRE_DIRECTIVE", "1")
+            not in ("0", "false", "no"),
+            imap_directive_markers=_csv("FACTORY_IMAP_DIRECTIVE_MARKERS")
+            or ["factory:", "@factory", "hey factory"],
             smtp_host=_env("FACTORY_SMTP_HOST"),
             smtp_port=int(_env("FACTORY_SMTP_PORT", "587")),
             smtp_user=_env("FACTORY_SMTP_USER"),

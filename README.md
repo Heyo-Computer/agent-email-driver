@@ -11,7 +11,9 @@ trigger email (unread) ─┘
 - **Linear** is the primary work queue. New tickets in a configured state get
   picked up automatically.
 - **Email** is a second trigger: an unread message's **subject becomes the
-  title** and its **body becomes the spec**.
+  title** and its **body becomes the spec** — but only after it passes
+  **triage** (allowlisted sender *and* an explicit directive; see below), so a
+  boot with a full inbox doesn't turn every newsletter into a PR.
 - For each item, factory opens a **draft PR** up front, writes a `printer` spec,
   runs `printer exec` to implement + review it, pushes the result, marks the PR
   **ready for review**, and reports back (Linear state/comment, or an email
@@ -121,10 +123,24 @@ echo "switch to JSON logging" | ./selfimprove.py "json logs" --body -
   picked up. On claim the issue moves to `In Progress` (so it won't re-trigger);
   when the PR is ready it moves to `In Review`. State is the dedup mechanism — no
   external database.
-- **Email**: only **unread** messages are processed (optionally restricted by
-  `FACTORY_IMAP_ALLOWED_SENDERS`). A message is marked read once its draft PR
-  exists, so it is handled exactly once. Completion is reported as a reply to the
-  sender.
+- **Email**: only **unread** messages are considered, and each must clear two
+  **triage** gates before it becomes work (both enforced in `tools/inbox.py`):
+  1. **Sender allowlist** — the From address (or its domain) must be in
+     `FACTORY_IMAP_ALLOWED_SENDERS` (entries are full addresses or bare domains
+     like `@example.com`). **An empty allowlist rejects everything** — email
+     triggers are off until you configure it, so the inbox can't spawn PRs on
+     its own.
+  2. **Explicit directive** — the subject or body must contain one of
+     `FACTORY_IMAP_DIRECTIVE_MARKERS` (default `factory:`, `@factory`,
+     `hey factory`), i.e. the message actually asks factory to do something.
+     This keeps ordinary mail and automated notifications from an allowlisted
+     address from being mistaken for a request. Disable with
+     `FACTORY_IMAP_REQUIRE_DIRECTIVE=0`.
+
+  Triaged-out messages are **left unread**, so fixing the allowlist or adding a
+  marker lets a later poll pick them up. A message that passes is marked read
+  once its draft PR exists, so it is handled exactly once. Completion is
+  reported as a reply to the sender.
 
 ## Crash safety
 

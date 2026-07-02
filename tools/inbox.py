@@ -1,9 +1,22 @@
 """IMAP inbox monitor — the second trigger source.
 
-`fetch_triggers` returns unread messages (optionally restricted to an allowed
-sender list); subject becomes the work title and the plain-text body becomes the
-spec. `mark_seen` flips a message to read, which is the dedup mechanism so each
-email is processed exactly once.
+`fetch_triggers` returns unread messages that survive *triage* (see
+`_triage_reject`); the subject becomes the work title and the plain-text body
+becomes the spec. `mark_seen` flips a message to read, which is the dedup
+mechanism so each email is processed exactly once.
+
+Triage exists because the inbox is a shared, spammy surface: on boot every
+unread message — newsletters, CI notifications, calendar invites — would
+otherwise each spawn a PR. Two gates must both pass before an email is treated
+as work:
+
+  1. **sender allowlist** — the From address (or its domain) must be in
+     `FACTORY_IMAP_ALLOWED_SENDERS`. Not everyone gets to trigger a PR.
+  2. **explicit directive** — the message must actually ask the agent to do
+     something, signalled by one of `FACTORY_IMAP_DIRECTIVE_MARKERS` appearing
+     in the subject or body (e.g. `factory:`). This stops an allowlisted human's
+     ordinary correspondence (or an auto-reply from their address) from being
+     mistaken for a request.
 """
 
 from __future__ import annotations
@@ -73,9 +86,65 @@ def _strip_html(html: str) -> str:
     return "\n".join(line.strip() for line in text.splitlines()).strip()
 
 
+def _sender_allowed(sender: str, allowed: list[str]) -> bool:
+    """Is `sender` (a bare address) on the allowlist?
+
+    An allowlist entry is either a full address (`sam@sarocu.com`) or a bare
+    domain (`@example.com`, matching anyone at that domain). Empty allowlist
+    means "nobody is allowlisted" — the gate rejects, since an unconfigured
+    allowlist must not silently let the whole inbox trigger PRs.
+    """
+    if not sender:
+        return False
+    sender = sender.lower()
+    domain = "@" + sender.split("@", 1)[1] if "@" in sender else ""
+    for entry in allowed:
+        entry = entry.strip().lower()
+        if not entry:
+            continue
+        if entry.startswith("@"):
+            if domain and domain == entry:
+                return True
+        elif entry == sender:
+            return True
+    return False
+
+
+def _has_directive(subject: str, body: str, markers: list[str]) -> bool:
+    """Does the message explicitly ask the agent to act?
+
+    True if any marker appears (case-insensitively) in the subject or body. An
+    empty marker list disables this gate (any content counts as a request).
+    """
+    hay = f"{subject}\n{body}".lower()
+    active = [m.strip().lower() for m in markers if m.strip()]
+    if not active:
+        return True
+    return any(m in hay for m in active)
+
+
 class Inbox:
     def __init__(self, cfg):
         self.cfg = cfg
+
+    def _triage_reject(self, sender: str, subject: str, body: str) -> str | None:
+        """Return a reason string if this message should be skipped, else None.
+
+        Both gates are enforced here so the decision (and its rationale) lives
+        in one place and is logged uniformly.
+        """
+        cfg = self.cfg
+        if not _sender_allowed(sender, cfg.imap_allowed_senders):
+            if not cfg.imap_allowed_senders:
+                return ("no allowlist configured (set FACTORY_IMAP_ALLOWED_SENDERS "
+                        "to enable email triggers)")
+            return f"sender {sender!r} not in allowlist"
+        if cfg.imap_require_directive and not _has_directive(
+            subject, body, cfg.imap_directive_markers
+        ):
+            return (f"no directive marker "
+                    f"({', '.join(cfg.imap_directive_markers)}) in subject/body")
+        return None
 
     def _connect(self) -> imaplib.IMAP4:
         cfg = self.cfg
@@ -89,11 +158,11 @@ class Inbox:
         return conn
 
     def fetch_triggers(self) -> list[Trigger]:
-        """Return UNSEEN messages that pass the sender allowlist.
+        """Return UNSEEN messages that survive triage (sender + directive gates).
 
         Messages are NOT marked read here — call mark_seen after the work item
         has been claimed (a draft PR exists) so a crash before claiming leaves
-        the email re-processable.
+        the email re-processable. Triaged-out messages are also left unread.
         """
         cfg = self.cfg
         if not cfg.imap_enabled:
@@ -111,7 +180,6 @@ class Inbox:
                 log.error("IMAP search failed: %s", data)
                 return []
             uids = data[0].split()
-            allowed = {a.lower() for a in cfg.imap_allowed_senders}
             for uid in uids:
                 uid_s = uid.decode()
                 typ, fetched = conn.uid("fetch", uid, "(BODY.PEEK[])")
@@ -120,16 +188,22 @@ class Inbox:
                 msg = email.message_from_bytes(fetched[0][1])
                 sender_full = _decode(msg.get("From"))
                 sender = parseaddr(sender_full)[1].lower()
-                if allowed and sender not in allowed:
-                    log.info("inbox: skipping non-allowlisted sender %s", sender)
+                subject = _decode(msg.get("Subject")).strip() or "(no subject)"
+                body = _plain_body(msg).strip()
+                reason = self._triage_reject(sender, subject, body)
+                if reason:
+                    # Leave the message UNSEEN so a later allowlist/marker fix
+                    # can still pick it up; just don't act on it now.
+                    log.info("inbox: triaged out uid=%s from %s: %s",
+                             uid_s, sender or "?", reason)
                     continue
                 triggers.append(
                     Trigger(
                         uid=uid_s,
                         sender=sender,
                         sender_full=sender_full,
-                        subject=_decode(msg.get("Subject")).strip() or "(no subject)",
-                        body=_plain_body(msg).strip(),
+                        subject=subject,
+                        body=body,
                         message_id=(msg.get("Message-ID") or "").strip(),
                     )
                 )
