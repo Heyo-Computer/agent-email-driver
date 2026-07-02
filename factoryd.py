@@ -177,6 +177,36 @@ def main(argv: list[str] | None = None) -> int:
         lin_ok = factory.linear.probe() if cfg.linear_enabled else None
         log.info("linear MCP reachable: %s",
                  "OK" if lin_ok else ("off" if lin_ok is None else "FAILED"))
+
+        # IMAP: dump the exact credentials loaded from the environment/.env so
+        # they can be eyeballed, then attempt a real login. Secrets are printed
+        # in full here on purpose — --probe is an on-demand check, not the
+        # always-on daemon log, so this does not persist to the service log.
+        if cfg.imap_enabled:
+            log.info(
+                "IMAP config: host=%r port=%r user=%r pass=%r folder=%r",
+                cfg.imap_host, cfg.imap_port, cfg.imap_user,
+                cfg.imap_pass, cfg.imap_folder,
+            )
+            try:
+                conn = factory.inbox._connect()
+                conn.logout()
+                log.info("IMAP login: OK")
+            except Exception as e:  # noqa: BLE001
+                log.error("IMAP login: FAILED: %s", e)
+        else:
+            log.info("IMAP config: off (host/user/pass not all set)")
+
+        # SMTP too, for symmetry — same credentials story bites notifications.
+        if cfg.smtp_enabled:
+            log.info(
+                "SMTP config: host=%r port=%r user=%r pass=%r from=%r starttls=%r",
+                cfg.smtp_host, cfg.smtp_port, cfg.smtp_user,
+                cfg.smtp_pass, cfg.smtp_from, cfg.smtp_starttls,
+            )
+        else:
+            log.info("SMTP config: off (host/from not set)")
+
         return 0 if gh_ok else 1
 
     if args.once:
