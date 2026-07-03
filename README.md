@@ -139,8 +139,16 @@ echo "switch to JSON logging" | ./selfimprove.py "json logs" --body -
 
   Triaged-out messages are **left unread**, so fixing the allowlist or adding a
   marker lets a later poll pick them up. A message that passes is marked read
-  once its draft PR exists, so it is handled exactly once. Completion is
-  reported as a reply to the sender.
+  once its draft PR exists, so it is handled exactly once.
+
+  **Thread context**: if the trigger is a *reply*, the earlier messages in the
+  thread (looked up by `References` / `In-Reply-To` in the monitored folder) are
+  folded into the spec as context, so a terse "factory: do what we agreed"
+  still carries the conversation that defined the work.
+
+  **Replies to the sender**: the requester gets an in-thread reply **when the
+  draft PR is opened** (acknowledgement + PR link) and **again when it's ready
+  for review** (or if it fails). Both are threaded onto the original message.
 
 ## Crash safety
 

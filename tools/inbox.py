@@ -23,11 +23,16 @@ from __future__ import annotations
 
 import email
 import imaplib
+import re
 from dataclasses import dataclass
 from email.header import decode_header, make_header
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 
 from util import log
+
+# Cap thread reconstruction so a long history can't produce a giant spec.
+_MAX_THREAD_MSGS = 20
+_MAX_THREAD_CHARS = 8000
 
 
 @dataclass
@@ -84,6 +89,19 @@ def _strip_html(html: str) -> str:
     text = re.sub(r"&nbsp;", " ", text)
     text = re.sub(r"[ \t]+", " ", text)
     return "\n".join(line.strip() for line in text.splitlines()).strip()
+
+
+def _msgids(*headers: str | None) -> list[str]:
+    """Extract `<message-id>` tokens (with angle brackets) from header values,
+    de-duplicated, preserving first-seen order."""
+    seen: list[str] = []
+    for h in headers:
+        if not h:
+            continue
+        for mid in re.findall(r"<[^>]+>", h):
+            if mid not in seen:
+                seen.append(mid)
+    return seen
 
 
 def _sender_allowed(sender: str, allowed: list[str]) -> bool:
@@ -157,6 +175,56 @@ class Inbox:
         conn.select(cfg.imap_folder)
         return conn
 
+    def _thread_context(self, conn: imaplib.IMAP4, msg) -> str:
+        """Reconstruct earlier messages in this email's thread as a transcript.
+
+        A reply usually only restates the latest ask; the request it refers to
+        ("do what we discussed") lives in the messages before it. We look up the
+        Message-IDs from References / In-Reply-To in the current folder and
+        render them oldest-first so the spec carries the whole conversation.
+        Messages not present in this folder (e.g. only in Sent) are skipped.
+        """
+        own = (msg.get("Message-ID") or "").strip()
+        refs = [m for m in _msgids(msg.get("References"), msg.get("In-Reply-To"))
+                if m != own]
+        if not refs:
+            return ""
+        collected: list[tuple[float, str, str]] = []
+        for mid in refs[-_MAX_THREAD_MSGS:]:
+            try:
+                typ, data = conn.uid("search", None, "HEADER", "Message-ID",
+                                     f'"{mid}"')
+                if typ != "OK" or not data or not data[0]:
+                    continue
+                muid = data[0].split()[0]
+                typ, fetched = conn.uid("fetch", muid, "(BODY.PEEK[])")
+                if typ != "OK" or not fetched or not isinstance(fetched[0], tuple):
+                    continue
+                m = email.message_from_bytes(fetched[0][1])
+            except Exception as e:  # noqa: BLE001 - context is best-effort
+                log.debug("inbox: thread fetch failed for %s: %s", mid, e)
+                continue
+            try:
+                dt = parsedate_to_datetime(m.get("Date")) if m.get("Date") else None
+                # .timestamp() copes with both aware and naive datetimes, so the
+                # sort below never trips over a tz mismatch.
+                order = dt.timestamp() if dt else float("inf")
+                stamp = dt.strftime("%Y-%m-%d %H:%M") if dt else "unknown date"
+            except Exception:  # noqa: BLE001
+                order, stamp = float("inf"), "unknown date"
+            frm = _decode(m.get("From")) or "unknown sender"
+            collected.append((order, stamp, frm, _plain_body(m).strip()))
+        if not collected:
+            return ""
+        collected.sort(key=lambda c: c[0])
+        blocks = [f"**From {frm} — {stamp}**\n{body or '(no text)'}"
+                  for _order, stamp, frm, body in collected]
+        transcript = "\n\n".join(blocks).strip()
+        if len(transcript) > _MAX_THREAD_CHARS:
+            transcript = (transcript[:_MAX_THREAD_CHARS].rstrip()
+                          + "\n\n…(earlier thread truncated)")
+        return transcript
+
     def fetch_triggers(self) -> list[Trigger]:
         """Return UNSEEN messages that survive triage (sender + directive gates).
 
@@ -197,6 +265,21 @@ class Inbox:
                     log.info("inbox: triaged out uid=%s from %s: %s",
                              uid_s, sender or "?", reason)
                     continue
+                # If this is a reply, fold the earlier thread in as context so
+                # the spec reflects the whole conversation, not just the reply.
+                context = ""
+                try:
+                    context = self._thread_context(conn, msg)
+                except Exception as e:  # noqa: BLE001 - never fail a trigger on this
+                    log.debug("inbox: thread context failed for uid=%s: %s",
+                              uid_s, e)
+                if context:
+                    body = (
+                        f"{body}\n\n---\n\n"
+                        f"## Earlier messages in this thread (context)\n\n"
+                        f"{context}\n"
+                    )
+                    log.info("inbox: attached thread context to uid=%s", uid_s)
                 triggers.append(
                     Trigger(
                         uid=uid_s,

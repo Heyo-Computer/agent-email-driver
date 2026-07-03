@@ -107,6 +107,19 @@ class Pipeline:
                                  f"🏭 factory picked this up — draft PR: {pr}")
         elif item.source == "email":
             self.inbox.mark_seen(item.ref)
+            if item.reply_to:
+                # Acknowledge in-thread as soon as the draft PR exists, so the
+                # requester knows their email was picked up (a second reply goes
+                # out from _complete once it's ready for review).
+                self.notifier.send(
+                    f"Re: {item.title}",
+                    f"factory picked up your request and opened a draft PR:\n\n"
+                    f"{pr}\n\n"
+                    f"It's being implemented now — you'll get another reply when "
+                    f"it's ready for review.\n",
+                    to=item.reply_to,
+                    in_reply_to=item.reply_msgid or None,
+                )
         self.notifier.send(
             f"factory started: {item.title}",
             f"Source: {item.source}\nDraft PR: {pr}\n",
