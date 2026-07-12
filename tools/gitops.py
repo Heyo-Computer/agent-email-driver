@@ -46,9 +46,13 @@ class Git:
             log.error("git fetch failed")
             return False
         if self.local_branch_exists(branch):
-            return self._git(["switch", branch]).ok
+            if not self._git(["switch", branch]).ok:
+                return False
+            return self._merge_base(branch)
         if self.remote_branch_exists(branch):
-            return self._git(["switch", "--track", f"origin/{branch}"]).ok
+            if not self._git(["switch", "--track", f"origin/{branch}"]).ok:
+                return False
+            return self._merge_base(branch)
         base = self.cfg.base_branch
         start = f"origin/{base}"
         if not self._git(["rev-parse", "--verify", "--quiet", start]).ok:
@@ -56,6 +60,21 @@ class Git:
         res = self._git(["switch", "-c", branch, start])
         if not res.ok:
             log.error("git switch -c %s failed: %s", branch, res.err.strip())
+            return False
+        return True
+
+    def _merge_base(self, branch: str) -> bool:
+        """Fold the latest origin/<base> into a reused branch so resumed work
+        starts from current base, not wherever the branch was originally cut.
+        A conflict aborts the merge and fails branch preparation."""
+        base_ref = f"origin/{self.cfg.base_branch}"
+        if not self._git(["rev-parse", "--verify", "--quiet", base_ref]).ok:
+            return True
+        res = self._git(["merge", "--no-edit", base_ref])
+        if not res.ok:
+            self._git(["merge", "--abort"])
+            log.error("could not merge %s into %s: %s", base_ref, branch,
+                      res.err.strip())
             return False
         return True
 

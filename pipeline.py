@@ -81,6 +81,7 @@ class Pipeline:
         self._claim(item, pr)
 
         # 5. execute
+        head_before = self.git.head()
         outcome = self.printer.exec_spec(spec_path)
 
         # commit + push whatever printer produced (visible on the draft PR)
@@ -89,6 +90,14 @@ class Pipeline:
 
         if not outcome.success:
             self._fail(item, pr, outcome.reason)
+            return
+
+        # A "successful" exec that moved nothing past the spec commit means the
+        # agent never actually did the work — keep the PR a draft and flag it.
+        if not self.cfg.dry_run and self.git.head() == head_before:
+            self._fail(item, pr,
+                       "printer exec exited 0 but produced no changes "
+                       "(implementation commit is empty)")
             return
 
         # 6. ready for review
