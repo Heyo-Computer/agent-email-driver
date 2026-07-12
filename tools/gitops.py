@@ -23,6 +23,11 @@ class Git:
     def _git(self, args: list[str], timeout: int = 120) -> Result:
         return run(["git", *args], cwd=self.repo, timeout=timeout)
 
+    def for_repo(self, repo: Path) -> "Git":
+        """A Git bound to another working tree (same cfg) — used to operate
+        inside a per-item worktree."""
+        return type(self)(self.cfg, repo=repo)
+
     def remote_branch_exists(self, branch: str) -> bool:
         res = self._git(["ls-remote", "--heads", "origin", branch])
         return res.ok and bool(res.out.strip())
@@ -48,11 +53,11 @@ class Git:
         if self.local_branch_exists(branch):
             if not self._git(["switch", branch]).ok:
                 return False
-            return self._merge_base(branch)
+            return self.merge_base(branch)
         if self.remote_branch_exists(branch):
             if not self._git(["switch", "--track", f"origin/{branch}"]).ok:
                 return False
-            return self._merge_base(branch)
+            return self.merge_base(branch)
         base = self.cfg.base_branch
         start = f"origin/{base}"
         if not self._git(["rev-parse", "--verify", "--quiet", start]).ok:
@@ -63,7 +68,68 @@ class Git:
             return False
         return True
 
-    def _merge_base(self, branch: str) -> bool:
+    # --- worktree isolation: one checkout per work item -------------------------
+
+    def worktree_add(self, path: Path, branch: str) -> bool:
+        """Check out `branch` in a dedicated worktree at `path`, creating the
+        branch off origin/<base> when it doesn't exist yet. Fetches first so
+        new branches start from the current base. Reuses a leftover worktree
+        already on `branch` (crash-resume keeps its in-flight work); a
+        worktree in any other state is recreated."""
+        if self.cfg.dry_run:
+            log.info("[dry-run] would add worktree %s for %s", path, branch)
+            return True
+        if not self._git(["fetch", "origin"]).ok:
+            log.error("git fetch failed")
+            return False
+        path = Path(path)
+        if (path / ".git").exists():
+            res = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path)
+            if res.ok and res.out.strip() == branch:
+                return True
+            log.warning("worktree %s is on %r, not %r; recreating",
+                        path, res.out.strip(), branch)
+            if not self.worktree_remove(path):
+                return False
+        # Drop stale registrations (a deleted worktree dir still pins its
+        # branch until pruned), and free the branch if the main checkout is
+        # sitting on it from the pre-worktree flow.
+        self._git(["worktree", "prune"])
+        if self.current_branch() == branch:
+            self._git(["switch", self.cfg.base_branch])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if self.local_branch_exists(branch):
+            res = self._git(["worktree", "add", str(path), branch])
+        elif self.remote_branch_exists(branch):
+            res = self._git(["worktree", "add", "--track", "-b", branch,
+                             str(path), f"origin/{branch}"])
+        else:
+            start = f"origin/{self.cfg.base_branch}"
+            if not self._git(["rev-parse", "--verify", "--quiet", start]).ok:
+                start = self.cfg.base_branch
+            res = self._git(["worktree", "add", "-b", branch, str(path), start])
+        if not res.ok:
+            log.error("git worktree add failed: %s", res.err.strip())
+            return False
+        return True
+
+    def worktree_remove(self, path: Path) -> bool:
+        """Remove a worktree. Forced — leftover uncommitted junk must not
+        block cleanup (anything worth keeping was committed to the branch,
+        which survives worktree removal)."""
+        if self.cfg.dry_run:
+            log.info("[dry-run] would remove worktree %s", path)
+            return True
+        if not Path(path).exists():
+            self._git(["worktree", "prune"])
+            return True
+        res = self._git(["worktree", "remove", "--force", str(path)])
+        if not res.ok:
+            log.error("git worktree remove failed: %s", res.err.strip())
+            return False
+        return True
+
+    def merge_base(self, branch: str) -> bool:
         """Fold the latest origin/<base> into a reused branch so resumed work
         starts from current base, not wherever the branch was originally cut.
         A conflict aborts the merge and fails branch preparation."""

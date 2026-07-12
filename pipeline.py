@@ -44,44 +44,60 @@ class Pipeline:
 
     # --- naming (deterministic, so restarts re-derive the same branch/spec) ----
 
-    def _names(self, item: WorkItem) -> tuple[str, str, Path]:
+    def _names(self, item: WorkItem) -> tuple[str, str]:
         if item.identifier:
             stem = f"{item.identifier.lower()}-{slugify(item.title)}"
         else:
             stem = f"email-{slugify(item.title)}"
         branch = f"{self.cfg.branch_prefix}/{stem}"
-        spec_path = self.cfg.repo_path / self.cfg.specs_dir / f"{stem}.md"
-        return branch, stem, spec_path
+        return branch, stem
+
+    def _worktree(self, item: WorkItem) -> Path:
+        _branch, stem = self._names(item)
+        return self.cfg.worktrees_dir / stem
 
     # --- orchestration ---------------------------------------------------------
 
     def process(self, item: WorkItem, *, resume: bool = False) -> None:
-        branch, stem, spec_path = self._names(item)
-        log.info("=== processing%s %s [%s] '%s' -> %s",
+        branch, stem = self._names(item)
+        wt = self._worktree(item)
+        log.info("=== processing%s %s [%s] '%s' -> %s (worktree %s)",
                  " (resume)" if resume else "",
-                 item.source, item.identifier or item.ref, item.title, branch)
+                 item.source, item.identifier or item.ref, item.title, branch, wt)
 
         # Journal first: from here on a crash leaves a record to resume from.
         if self.journal:
             self.journal.record(item)
 
-        # A crash mid-exec can leave uncommitted agent work on the item's
-        # branch; bank it before prepare_branch (whose base merge would
-        # otherwise refuse a dirty tree).
-        if (resume and self.git.current_branch() == branch
-                and self.git.has_uncommitted()):
-            self.git.commit_all(f"factory: recover in-progress work for {item.title}")
-
-        # 1-2. branch + spec + commit + push
-        if not self.git.prepare_branch(branch):
-            self._fail(item, None, "could not prepare git branch")
+        # 1. isolated worktree with the item's branch checked out. Each item
+        # gets its own checkout (and its own `.printer/` state) so work items
+        # can never pollute each other or the main checkout.
+        if not self.git.worktree_add(wt, branch):
+            self._fail(item, None, "could not prepare git worktree")
             return
+        git = self.git.for_repo(wt)
+        printer = self.printer.for_repo(wt)
+
+        # A crash mid-exec can leave uncommitted agent work in the reused
+        # worktree; bank it before the base merge (which refuses a dirty tree).
+        if resume and git.has_uncommitted():
+            git.commit_all(f"factory: recover in-progress work for {item.title}")
+
+        # Reused branches start from wherever they were cut; fold in current
+        # base. (No-op for branches just created off origin/<base>.)
+        if not git.merge_base(branch):
+            self._fail(item, None,
+                       f"could not merge latest {self.cfg.base_branch} into {branch}")
+            return
+
+        # 2. spec + commit + push
+        spec_path = wt / self.cfg.specs_dir / f"{stem}.md"
         self.specgen.write_spec(spec_path, title=item.title, body=item.body)
         rel_spec = f"{self.cfg.specs_dir}/{spec_path.name}"
-        if not self.git.commit_paths([rel_spec], f"factory: spec for {item.title}"):
+        if not git.commit_paths([rel_spec], f"factory: spec for {item.title}"):
             self._fail(item, None, "could not commit spec")
             return
-        if not self.git.push(branch):
+        if not git.push(branch):
             self._fail(item, None, "could not push branch")
             return
 
@@ -97,13 +113,13 @@ class Pipeline:
         # 4. claim (dedup commit point) + "started" notice
         self._claim(item, pr, resume=resume)
 
-        # 5. execute
-        head_before = self.git.head()
-        outcome = self.printer.exec_spec(spec_path)
+        # 5. execute (inside the worktree)
+        head_before = git.head()
+        outcome = printer.exec_spec(spec_path)
 
         # commit + push whatever printer produced (visible on the draft PR)
-        self.git.commit_all(f"factory: implement {item.title}")
-        self.git.push(branch)
+        git.commit_all(f"factory: implement {item.title}")
+        git.push(branch)
 
         if not outcome.success:
             self._fail(item, pr, outcome.reason)
@@ -111,7 +127,7 @@ class Pipeline:
 
         # A "successful" exec that moved nothing past the spec commit means the
         # agent never actually did the work — keep the PR a draft and flag it.
-        if not self.cfg.dry_run and self.git.head() == head_before:
+        if not self.cfg.dry_run and git.head() == head_before:
             self._fail(item, pr,
                        "printer exec exited 0 but produced no changes "
                        "(implementation commit is empty)")
@@ -181,6 +197,7 @@ class Pipeline:
     def _complete(self, item: WorkItem, pr: str) -> None:
         if self.journal:
             self.journal.clear(item)
+        self.git.worktree_remove(self._worktree(item))
         msg = f"PR ready for review: {pr}"
         if item.source == "linear":
             self.linear.comment(item.identifier or item.ref, f"✅ {msg}")
@@ -195,9 +212,10 @@ class Pipeline:
     def _fail(self, item: WorkItem, pr: str | None, reason: str) -> None:
         # Reported failures are terminal: the requester is told, so a restart
         # must not silently retry. Only an unreported interruption (crash)
-        # leaves the journal entry behind for resume.
+        # leaves the journal entry (and its worktree) behind for resume.
         if self.journal:
             self.journal.clear(item)
+        self.git.worktree_remove(self._worktree(item))
         log.warning("FAILED %s '%s': %s", item.source, item.title, reason)
         note = f"⚠️ factory could not finish this: {reason}"
         if pr:

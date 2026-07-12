@@ -122,6 +122,11 @@ class Config:
     supervisor_program: str        # program name supervisord runs factory under
 
     @property
+    def worktrees_dir(self) -> Path:
+        """Per-item git worktrees (isolated checkouts of the target repo)."""
+        return self.state_dir / "worktrees"
+
+    @property
     def linear_enabled(self) -> bool:
         return bool(self.linear_team)
 

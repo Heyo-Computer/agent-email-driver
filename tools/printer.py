@@ -55,6 +55,11 @@ class Printer:
         self.cfg = cfg
         self.repo = repo or cfg.repo_path
 
+    def for_repo(self, repo: Path) -> "Printer":
+        """A Printer bound to another working tree (same cfg) — used to run
+        the exec inside a per-item worktree."""
+        return type(self)(self.cfg, repo=repo)
+
     def exec_spec(self, spec_path: Path, *, resume: bool = False) -> ExecOutcome:
         """Run `printer exec` for a spec. Long-running; no wall-clock timeout."""
         cfg = self.cfg
