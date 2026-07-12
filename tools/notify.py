@@ -15,6 +15,12 @@ from email.utils import formatdate, make_msgid
 from util import log
 
 
+def reply_subject(subject: str) -> str:
+    """Subject line for an in-thread reply: prefix `Re: ` exactly once."""
+    s = (subject or "").strip()
+    return s if s.lower().startswith("re:") else f"Re: {s}"
+
+
 class Notifier:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -26,11 +32,14 @@ class Notifier:
         *,
         to: str | None = None,
         in_reply_to: str | None = None,
+        references: str | None = None,
     ) -> bool:
         """Send a plain-text email. Returns True on success.
 
         In dry-run mode (or when SMTP is unconfigured) it logs and returns
-        without sending. `in_reply_to` threads a reply to an inbound message.
+        without sending. `in_reply_to` threads a reply to an inbound message;
+        `references` carries the full thread chain (falls back to
+        `in_reply_to`) so replies deep in a conversation still thread.
         """
         cfg = self.cfg
         recipient = to or cfg.notify_to
@@ -49,7 +58,7 @@ class Notifier:
         msg["Message-ID"] = make_msgid(domain="factory")
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
-            msg["References"] = in_reply_to
+            msg["References"] = references or in_reply_to
         msg.set_content(body)
 
         try:

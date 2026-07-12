@@ -75,6 +75,10 @@ class Config:
     poll_interval: int
     dry_run: bool
 
+    # Crash-resume journal (in-flight work items, re-queued on startup)
+    state_dir: Path
+    resume_max_attempts: int
+
     # Linear (via the Linear MCP server, reached through `claude -p`)
     linear_team: str
     linear_trigger_state: str
@@ -139,6 +143,10 @@ class Config:
             specs_dir=_env("FACTORY_SPECS_DIR", "specs"),
             poll_interval=int(_env("FACTORY_POLL_INTERVAL", "180")),
             dry_run=_env("FACTORY_DRY_RUN", "") not in ("", "0", "false", "no"),
+            state_dir=Path(
+                _env("FACTORY_STATE_DIR", "~/.factory/state")
+            ).expanduser().resolve(),
+            resume_max_attempts=int(_env("FACTORY_RESUME_MAX_ATTEMPTS", "3")),
             linear_team=_env("FACTORY_LINEAR_TEAM", ""),
             linear_trigger_state=_env("FACTORY_LINEAR_TRIGGER_STATE", "Todo"),
             linear_inprogress_state=_env(

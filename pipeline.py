@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from tools.notify import reply_subject
 from util import log, slugify
 
 
@@ -23,11 +24,14 @@ class WorkItem:
     identifier: str = ""   # linear ENG-123 (for branch/state ops); "" for email
     reply_to: str = ""     # email sender address (email source only)
     reply_msgid: str = ""  # email Message-ID for threading (email source only)
+    reply_refs: str = ""   # full References chain incl. reply_msgid (email only)
+    reply_subject: str = ""  # original email subject, for in-thread replies
     target: str = "repo"   # "repo" (customer pipeline) | "self" (self-improvement)
 
 
 class Pipeline:
-    def __init__(self, cfg, *, git, gh, printer, specgen, linear, inbox, notifier):
+    def __init__(self, cfg, *, git, gh, printer, specgen, linear, inbox, notifier,
+                 journal=None):
         self.cfg = cfg
         self.git = git
         self.gh = gh
@@ -36,6 +40,7 @@ class Pipeline:
         self.linear = linear
         self.inbox = inbox
         self.notifier = notifier
+        self.journal = journal
 
     # --- naming (deterministic, so restarts re-derive the same branch/spec) ----
 
@@ -50,10 +55,22 @@ class Pipeline:
 
     # --- orchestration ---------------------------------------------------------
 
-    def process(self, item: WorkItem) -> None:
+    def process(self, item: WorkItem, *, resume: bool = False) -> None:
         branch, stem, spec_path = self._names(item)
-        log.info("=== processing %s [%s] '%s' -> %s",
+        log.info("=== processing%s %s [%s] '%s' -> %s",
+                 " (resume)" if resume else "",
                  item.source, item.identifier or item.ref, item.title, branch)
+
+        # Journal first: from here on a crash leaves a record to resume from.
+        if self.journal:
+            self.journal.record(item)
+
+        # A crash mid-exec can leave uncommitted agent work on the item's
+        # branch; bank it before prepare_branch (whose base merge would
+        # otherwise refuse a dirty tree).
+        if (resume and self.git.current_branch() == branch
+                and self.git.has_uncommitted()):
+            self.git.commit_all(f"factory: recover in-progress work for {item.title}")
 
         # 1-2. branch + spec + commit + push
         if not self.git.prepare_branch(branch):
@@ -78,7 +95,7 @@ class Pipeline:
             return
 
         # 4. claim (dedup commit point) + "started" notice
-        self._claim(item, pr)
+        self._claim(item, pr, resume=resume)
 
         # 5. execute
         head_before = self.git.head()
@@ -106,51 +123,81 @@ class Pipeline:
         # 7. completion update
         self._complete(item, pr)
 
+    # --- notifications ----------------------------------------------------------
+
+    def _reply(self, item: WorkItem, body: str, *, to: str) -> None:
+        """Email a status update inside the original trigger's thread."""
+        self.notifier.send(
+            reply_subject(item.reply_subject or item.title),
+            body,
+            to=to,
+            in_reply_to=item.reply_msgid or None,
+            references=item.reply_refs or None,
+        )
+
+    def _notify_owner(self, item: WorkItem, subject: str, body: str) -> None:
+        """Status notice to the owner (cfg.notify_to). For email-triggered work
+        it threads into the trigger's conversation instead of starting a new
+        one — and is skipped when the owner is the requester, who already got
+        the in-thread reply."""
+        if item.source == "email" and item.reply_msgid:
+            if item.reply_to and item.reply_to.lower() == self.cfg.notify_to.lower():
+                return
+            self._reply(item, body, to=self.cfg.notify_to)
+            return
+        self.notifier.send(subject, body)
+
     # --- per-source claim / completion / failure -------------------------------
 
-    def _claim(self, item: WorkItem, pr: str) -> None:
+    def _claim(self, item: WorkItem, pr: str, *, resume: bool = False) -> None:
         if item.source == "linear":
             self.linear.set_state(item.identifier or item.ref,
                                   self.cfg.linear_inprogress_state)
-            self.linear.comment(item.identifier or item.ref,
-                                 f"🏭 factory picked this up — draft PR: {pr}")
+            if not resume:
+                self.linear.comment(item.identifier or item.ref,
+                                    f"🏭 factory picked this up — draft PR: {pr}")
         elif item.source == "email":
             self.inbox.mark_seen(item.ref)
-            if item.reply_to:
+            if item.reply_to and not resume:
                 # Acknowledge in-thread as soon as the draft PR exists, so the
                 # requester knows their email was picked up (a second reply goes
-                # out from _complete once it's ready for review).
-                self.notifier.send(
-                    f"Re: {item.title}",
+                # out from _complete once it's ready for review). Skipped on
+                # resume — they were already acknowledged before the crash.
+                self._reply(
+                    item,
                     f"factory picked up your request and opened a draft PR:\n\n"
                     f"{pr}\n\n"
                     f"It's being implemented now — you'll get another reply when "
                     f"it's ready for review.\n",
                     to=item.reply_to,
-                    in_reply_to=item.reply_msgid or None,
                 )
-        self.notifier.send(
-            f"factory started: {item.title}",
-            f"Source: {item.source}\nDraft PR: {pr}\n",
+        verb = "resumed" if resume else "started"
+        self._notify_owner(
+            item,
+            f"factory {verb}: {item.title}",
+            f"factory {verb} this item.\nSource: {item.source}\nDraft PR: {pr}\n",
         )
 
     def _complete(self, item: WorkItem, pr: str) -> None:
+        if self.journal:
+            self.journal.clear(item)
         msg = f"PR ready for review: {pr}"
         if item.source == "linear":
             self.linear.comment(item.identifier or item.ref, f"✅ {msg}")
             self.linear.set_state(item.identifier or item.ref,
                                   self.cfg.linear_review_state)
         elif item.source == "email" and item.reply_to:
-            self.notifier.send(
-                f"Re: {item.title}",
-                f"Your request is done.\n\n{msg}\n",
-                to=item.reply_to,
-                in_reply_to=item.reply_msgid or None,
-            )
-        self.notifier.send(f"factory done: {item.title}", msg)
+            self._reply(item, f"Your request is done.\n\n{msg}\n",
+                        to=item.reply_to)
+        self._notify_owner(item, f"factory done: {item.title}", msg)
         log.info("=== done %s '%s' -> %s", item.source, item.title, pr)
 
     def _fail(self, item: WorkItem, pr: str | None, reason: str) -> None:
+        # Reported failures are terminal: the requester is told, so a restart
+        # must not silently retry. Only an unreported interruption (crash)
+        # leaves the journal entry behind for resume.
+        if self.journal:
+            self.journal.clear(item)
         log.warning("FAILED %s '%s': %s", item.source, item.title, reason)
         note = f"⚠️ factory could not finish this: {reason}"
         if pr:
@@ -160,14 +207,14 @@ class Pipeline:
                                   self.cfg.linear_blocked_state)
             self.linear.comment(item.identifier or item.ref, note)
         if item.source == "email" and item.reply_to:
-            self.notifier.send(
-                f"Re: {item.title}",
+            self._reply(
+                item,
                 f"factory could not finish this request.\n\nReason: {reason}\n"
                 + (f"Draft PR (partial): {pr}\n" if pr else ""),
                 to=item.reply_to,
-                in_reply_to=item.reply_msgid or None,
             )
-        self.notifier.send(
+        self._notify_owner(
+            item,
             f"factory FAILED: {item.title}",
             f"Source: {item.source}\nReason: {reason}\n"
             + (f"Draft PR: {pr}\n" if pr else ""),

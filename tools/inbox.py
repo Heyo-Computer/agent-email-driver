@@ -43,6 +43,7 @@ class Trigger:
     subject: str
     body: str
     message_id: str       # for In-Reply-To threading on the SMTP reply
+    references: str = ""  # full thread chain (References + own id), space-joined
 
 
 def _decode(value: str | None) -> str:
@@ -280,6 +281,13 @@ class Inbox:
                         f"{context}\n"
                     )
                     log.info("inbox: attached thread context to uid=%s", uid_s)
+                # Full chain for the reply's References header: the trigger's
+                # own ancestry plus its Message-ID, so our replies thread even
+                # when the trigger is itself deep in a conversation.
+                own_mid = (msg.get("Message-ID") or "").strip()
+                chain = _msgids(msg.get("References"), msg.get("In-Reply-To"))
+                if own_mid and own_mid not in chain:
+                    chain.append(own_mid)
                 triggers.append(
                     Trigger(
                         uid=uid_s,
@@ -287,7 +295,8 @@ class Inbox:
                         sender_full=sender_full,
                         subject=subject,
                         body=body,
-                        message_id=(msg.get("Message-ID") or "").strip(),
+                        message_id=own_mid,
+                        references=" ".join(chain),
                     )
                 )
         finally:

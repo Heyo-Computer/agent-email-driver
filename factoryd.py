@@ -24,6 +24,7 @@ from selfimprove import SelfImprover
 from tools.gh import Gh
 from tools.gitops import Git
 from tools.inbox import Inbox
+from tools.journal import Journal
 from tools.linear_mcp import Linear
 from tools.notify import Notifier
 from tools.printer import Printer
@@ -45,6 +46,7 @@ class Factory:
         self.linear = Linear(cfg)
         self.inbox = Inbox(cfg)
         self.notifier = Notifier(cfg)
+        self.journal = Journal(cfg)
         self.pipeline = Pipeline(
             cfg,
             git=Git(cfg),
@@ -54,6 +56,7 @@ class Factory:
             linear=self.linear,
             inbox=self.inbox,
             notifier=self.notifier,
+            journal=self.journal,
         )
         # Same reporting channels, but edits factory's own source instead of the
         # customer repo. Used for items whose title carries the self marker.
@@ -103,12 +106,56 @@ class Factory:
                             ref=t.uid,
                             reply_to=t.sender,
                             reply_msgid=t.message_id,
+                            reply_refs=t.references,
+                            reply_subject=t.subject,
                             target=target,
                         )
                     )
             except Exception as e:  # noqa: BLE001
                 log.exception("error polling inbox: %s", e)
         return items
+
+    def resume_pending(self) -> None:
+        """Re-queue work interrupted by a crash/restart (journal leftovers).
+
+        Runs once at startup, before the first poll, so an exec that died
+        mid-flight is picked up before any new triggers. Each entry gets a
+        bounded number of attempts; past that the item is abandoned with a
+        notification instead of crash-looping the daemon.
+        """
+        from dataclasses import fields as dc_fields
+        known = {f.name for f in dc_fields(WorkItem)}
+        for item_dict, attempts in self.journal.pending():
+            item = WorkItem(**{k: v for k, v in item_dict.items() if k in known})
+            attempt = self.journal.bump(item)
+            if attempt > self.cfg.resume_max_attempts:
+                self.journal.clear(item)
+                log.error("giving up on '%s' after %d interrupted attempts",
+                          item.title, attempts)
+                self.notifier.send(
+                    f"factory gave up: {item.title}",
+                    f"This item was interrupted {attempts} times "
+                    f"(crash or restart mid-run) and will not be retried.\n"
+                    f"Source: {item.source}\n",
+                )
+                continue
+            log.info("resuming in-flight %s '%s' (attempt %d/%d)",
+                     item.source, item.title, attempt,
+                     self.cfg.resume_max_attempts)
+            try:
+                if item.target == "self":
+                    # Self-updates are never auto-resumed: a broken one could
+                    # crash-loop the daemon it is modifying. Report instead.
+                    self.journal.clear(item)
+                    self.notifier.send(
+                        f"factory self-update interrupted: {item.title}",
+                        "A self-update was interrupted mid-run and was NOT "
+                        "resumed automatically. Re-send the request to retry.\n",
+                    )
+                else:
+                    self.pipeline.process(item, resume=True)
+            except Exception as e:  # noqa: BLE001 - a bad resume must not kill startup
+                log.exception("error resuming '%s': %s", item.title, e)
 
     def tick(self) -> int:
         items = self.collect()
@@ -141,6 +188,10 @@ class Factory:
             "on" if cfg.smtp_enabled else "off",
             "  [DRY-RUN]" if cfg.dry_run else "",
         )
+        try:
+            self.resume_pending()
+        except Exception as e:  # noqa: BLE001
+            log.exception("error during startup resume: %s", e)
         while not _stop:
             try:
                 self.tick()
@@ -210,6 +261,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if gh_ok else 1
 
     if args.once:
+        factory.resume_pending()
         n = factory.tick()
         log.info("single cycle complete (%d item(s)).", n)
         return 0

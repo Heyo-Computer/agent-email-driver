@@ -34,7 +34,8 @@ from config import Config
 from tools.gitops import Git
 from tools.inbox import Inbox
 from tools.linear_mcp import Linear
-from tools.notify import Notifier
+# Aliased: run() has a `reply_subject` parameter that would shadow the helper.
+from tools.notify import Notifier, reply_subject as _reply_subject_line
 from tools.printer import Printer
 from tools.selfupdate import SelfUpdater
 from tools.specgen import SpecGen
@@ -69,6 +70,8 @@ class SelfImprover:
             ref=getattr(item, "ref", ""),
             reply_to=getattr(item, "reply_to", ""),
             reply_msgid=getattr(item, "reply_msgid", ""),
+            reply_refs=getattr(item, "reply_refs", ""),
+            reply_subject=getattr(item, "reply_subject", ""),
         )
 
     # --- the core flow ---------------------------------------------------------
@@ -83,6 +86,8 @@ class SelfImprover:
         ref: str = "",
         reply_to: str = "",
         reply_msgid: str = "",
+        reply_refs: str = "",
+        reply_subject: str = "",
     ) -> bool:
         """Apply one improvement to factory's own source. Returns success.
 
@@ -90,6 +95,16 @@ class SelfImprover:
         restart SIGTERMs us mid-call — so all reporting happens *before* restart.
         """
         title = title.strip()
+        # Reply/threading context for this run's notifications. Held on the
+        # instance so the reporting helpers below don't each need four extra
+        # parameters; run() is the only entry point and the daemon is
+        # single-threaded.
+        self._reply_ctx = {
+            "to": reply_to,
+            "msgid": reply_msgid,
+            "refs": reply_refs,
+            "subject": reply_subject or title,
+        }
         stem = f"self-{slugify(title)}"
         spec_path = self.src / self.cfg.self_specs_dir / f"{stem}.md"
         log.info("=== self-improve [%s] '%s' -> %s", source, identifier or ref, title)
@@ -148,6 +163,29 @@ class SelfImprover:
 
     # --- reporting (mirrors pipeline.py, minus the PR) -------------------------
 
+    def _reply_email(self, body: str, *, to: str) -> None:
+        """Email a status update inside the trigger email's thread."""
+        ctx = getattr(self, "_reply_ctx", {})
+        self.notifier.send(
+            _reply_subject_line(ctx.get("subject") or ""),
+            body,
+            to=to,
+            in_reply_to=ctx.get("msgid") or None,
+            references=ctx.get("refs") or None,
+        )
+
+    def _owner_notice(self, source: str, subject: str, body: str) -> None:
+        """Owner status notice; for email-triggered updates it threads into the
+        trigger's conversation (and is skipped when the owner is the requester,
+        who already got the in-thread reply). Mirrors Pipeline._notify_owner."""
+        ctx = getattr(self, "_reply_ctx", {})
+        if source == "email" and ctx.get("msgid"):
+            if (ctx.get("to") or "").lower() == self.cfg.notify_to.lower():
+                return
+            self._reply_email(body, to=self.cfg.notify_to)
+            return
+        self.notifier.send(subject, body)
+
     def _claim(self, source, title, identifier, ref) -> None:
         if source == "linear" and (identifier or ref):
             self.linear.set_state(identifier or ref, self.cfg.linear_inprogress_state)
@@ -155,7 +193,7 @@ class SelfImprover:
                                 "🛠️ factory picked this up as a self-update.")
         elif source == "email" and ref:
             self.inbox.mark_seen(ref)
-        self.notifier.send(f"factory self-update started: {title}",
+        self._owner_notice(source, f"factory self-update started: {title}",
                            f"Source: {source}\nTarget: factory itself ({self.src})\n")
 
     def _report_done(self, source, title, identifier, ref, reply_to, reply_msgid,
@@ -166,9 +204,8 @@ class SelfImprover:
             self.linear.comment(identifier or ref, f"✅ {msg}")
             self.linear.set_state(identifier or ref, self.cfg.linear_review_state)
         elif source == "email" and reply_to:
-            self.notifier.send(f"Re: {title}", f"{msg}\n", to=reply_to,
-                               in_reply_to=reply_msgid or None)
-        self.notifier.send(f"factory self-update done: {title}", msg)
+            self._reply_email(f"{msg}\n", to=reply_to)
+        self._owner_notice(source, f"factory self-update done: {title}", msg)
 
     def _report_fail(self, source, title, identifier, ref, reply_to, reply_msgid,
                      reason) -> None:
@@ -180,9 +217,8 @@ class SelfImprover:
                 self.linear.set_state(identifier or ref, self.cfg.linear_blocked_state)
             self.linear.comment(identifier or ref, note)
         elif source == "email" and reply_to:
-            self.notifier.send(f"Re: {title}", note + "\n", to=reply_to,
-                               in_reply_to=reply_msgid or None)
-        self.notifier.send(f"factory self-update FAILED: {title}",
+            self._reply_email(note + "\n", to=reply_to)
+        self._owner_notice(source, f"factory self-update FAILED: {title}",
                            f"Source: {source}\nReason: {reason}\n")
 
 
