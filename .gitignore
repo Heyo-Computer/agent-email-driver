@@ -1,4 +1,5 @@
 .env
+supervisord.local.conf
 __pycache__/
 *.pyc
 factory.log

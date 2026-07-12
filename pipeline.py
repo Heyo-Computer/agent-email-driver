@@ -78,21 +78,35 @@ class Pipeline:
         git = self.git.for_repo(wt)
         printer = self.printer.for_repo(wt)
 
-        # A crash mid-exec can leave uncommitted agent work in the reused
-        # worktree; bank it before the base merge (which refuses a dirty tree).
-        if resume and git.has_uncommitted():
-            git.commit_all(f"factory: recover in-progress work for {item.title}")
+        # A detached exec may have kept running (or finished) while factory
+        # was down. While one is active the tree belongs to the agent: skip
+        # anything that would mutate it and go straight to re-attach/collect.
+        exec_active = resume and printer.exec_active()
+        if exec_active:
+            log.info("live/finished detached exec found for '%s'; re-attaching",
+                     item.title)
+        else:
+            # A crash mid-exec can leave uncommitted agent work in the reused
+            # worktree; bank it before the base merge (which refuses a dirty
+            # tree).
+            if resume and git.has_uncommitted():
+                git.commit_all(
+                    f"factory: recover in-progress work for {item.title}")
 
-        # Reused branches start from wherever they were cut; fold in current
-        # base. (No-op for branches just created off origin/<base>.)
-        if not git.merge_base(branch):
-            self._fail(item, None,
-                       f"could not merge latest {self.cfg.base_branch} into {branch}")
-            return
+            # Reused branches start from wherever they were cut; fold in
+            # current base. (No-op for branches just created off origin/<base>.)
+            if not git.merge_base(branch):
+                self._fail(item, None,
+                           f"could not merge latest {self.cfg.base_branch} "
+                           f"into {branch}")
+                return
 
-        # 2. spec + commit + push
+        # 2. spec + commit + push. The spec is only generated once: on resume
+        # the agent must keep working against the spec it started with (specgen
+        # goes through claude, so regenerating wouldn't be deterministic).
         spec_path = wt / self.cfg.specs_dir / f"{stem}.md"
-        self.specgen.write_spec(spec_path, title=item.title, body=item.body)
+        if not spec_path.is_file():
+            self.specgen.write_spec(spec_path, title=item.title, body=item.body)
         rel_spec = f"{self.cfg.specs_dir}/{spec_path.name}"
         if not git.commit_paths([rel_spec], f"factory: spec for {item.title}"):
             self._fail(item, None, "could not commit spec")
@@ -113,9 +127,12 @@ class Pipeline:
         # 4. claim (dedup commit point) + "started" notice
         self._claim(item, pr, resume=resume)
 
-        # 5. execute (inside the worktree)
-        head_before = git.head()
-        outcome = printer.exec_spec(spec_path)
+        # 5. execute (inside the worktree) — re-attaches to a live detached
+        # exec, collects a finished one, or spawns fresh. Task completions
+        # are surfaced to the requester as they happen so a long run doesn't
+        # look dead.
+        outcome = printer.exec_spec(
+            spec_path, on_progress=self._progress_cb(item, pr))
 
         # commit + push whatever printer produced (visible on the draft PR)
         git.commit_all(f"factory: implement {item.title}")
@@ -125,12 +142,15 @@ class Pipeline:
             self._fail(item, pr, outcome.reason)
             return
 
-        # A "successful" exec that moved nothing past the spec commit means the
-        # agent never actually did the work — keep the PR a draft and flag it.
-        if not self.cfg.dry_run and git.head() == head_before:
+        # A "successful" exec whose branch changes nothing beyond the spec
+        # means the agent never actually did the work — keep the PR a draft
+        # and flag it. (Diff-based so it stays correct across resumes and
+        # re-attached execs, where commits can predate this call.)
+        if not self.cfg.dry_run and not git.has_changes_beyond(
+                f"origin/{self.cfg.base_branch}", [self.cfg.specs_dir]):
             self._fail(item, pr,
                        "printer exec exited 0 but produced no changes "
-                       "(implementation commit is empty)")
+                       "beyond the spec")
             return
 
         # 6. ready for review
@@ -140,6 +160,29 @@ class Pipeline:
         self._complete(item, pr)
 
     # --- notifications ----------------------------------------------------------
+
+    def _progress_cb(self, item: WorkItem, pr: str):
+        """Progress reporter for the exec wait loop: emails the requester
+        in-thread (and posts to Linear) each time tasks complete, so long
+        runs are visibly alive. Failures are logged, never raised — progress
+        reporting must not take down the run."""
+        def cb(titles: list[str], done: int, total: int) -> None:
+            finished = "\n".join(f"  - {t}" for t in titles)
+            body = (
+                f"Progress: {done}/{total} tasks complete.\n\n"
+                f"Just finished:\n{finished}\n\n"
+                f"Each completed task is committed and pushed — the draft PR "
+                f"has the work so far:\n{pr}\n"
+            )
+            log.info("progress %d/%d: %s", done, total, "; ".join(titles))
+            if item.source == "email" and item.reply_to:
+                self._reply(item, body, to=item.reply_to)
+            elif item.source == "linear":
+                self.linear.comment(item.identifier or item.ref,
+                                    f"⏳ {done}/{total} tasks done — latest: "
+                                    f"{'; '.join(titles)}")
+            self._notify_owner(item, f"factory progress: {item.title}", body)
+        return cb
 
     def _reply(self, item: WorkItem, body: str, *, to: str) -> None:
         """Email a status update inside the original trigger's thread."""

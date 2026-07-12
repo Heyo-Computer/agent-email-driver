@@ -185,6 +185,18 @@ class Git:
     def has_uncommitted(self) -> bool:
         return bool(self._git(["status", "--porcelain"]).out.strip())
 
+    def has_changes_beyond(self, base_ref: str, exclude: list[str]) -> bool:
+        """Does HEAD change anything vs the merge-base with `base_ref`,
+        outside the `exclude`d paths? (The 'did the agent actually implement
+        something beyond the spec commit' check.)"""
+        if not self._git(["rev-parse", "--verify", "--quiet", base_ref]).ok:
+            return True  # no base to compare against; assume changes
+        res = self._git([
+            "diff", "--quiet", f"{base_ref}...HEAD", "--", ".",
+            *(f":(exclude){e}" for e in exclude),
+        ])
+        return not res.ok  # `diff --quiet` exits non-zero when there are diffs
+
     # --- self-update support: snapshot / rollback the running checkout ----------
 
     def current_branch(self) -> str:

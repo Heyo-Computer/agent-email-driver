@@ -3,17 +3,28 @@
 `printer exec <spec> --cwd <repo>` runs the plan/implement/review loop. Exit 0
 means success (all tasks done + review passed). Non-zero means blocked, stalled,
 max-turns, or error — we classify by peeking at the `.printer/exec/<key>.json`
-checkpoint and the tail of stderr. Resumable via `printer exec --continue`.
+checkpoint and the tail of the exec log. Resumable via `printer exec --continue`.
+
+The exec runs DETACHED (its own session, output to a log file, pid + exit code
+recorded under `.printer/factory-exec/` in the target tree). Factory merely
+waits on it, so a factory crash/restart — including the self-update restart,
+whose supervisor group-kill would otherwise take the exec down with it — leaves
+the agent running; on resume factory re-attaches to the live process (or picks
+up the recorded exit code if it finished while factory was away).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from util import Result, log, run
+from util import Result, log
 
 # Scaffold lines like `--- stdout ---` that carry no diagnostic content.
 _SECTION_HEADER = re.compile(r"^-{2,}[^-]*-{2,}$")
@@ -60,14 +71,72 @@ class Printer:
         the exec inside a per-item worktree."""
         return type(self)(self.cfg, repo=repo)
 
-    def exec_spec(self, spec_path: Path, *, resume: bool = False) -> ExecOutcome:
-        """Run `printer exec` for a spec. Long-running; no wall-clock timeout."""
+    # Poll cadence while waiting on the detached exec.
+    POLL_SECS = 5
+
+    def exec_spec(self, spec_path: Path, *, resume: bool = False,
+                  on_progress=None) -> ExecOutcome:
+        """Run `printer exec` for a spec, detached. Blocks until it finishes
+        (no wall-clock timeout), but the exec itself survives factory dying:
+        on a later call for the same tree we re-attach to the live process or
+        collect the exit code it left behind.
+
+        `on_progress(titles, done, total)` is called (best-effort) whenever
+        tasks newly transition to done while we wait, so the pipeline can
+        surface progress to the requester."""
         cfg = self.cfg
         rel = self._rel(spec_path)
         if cfg.dry_run:
             log.info("[dry-run] would run: printer exec %s --cwd %s", rel, self.repo)
             return ExecOutcome(True, "dry-run", "Done")
 
+        # Baseline of already-done tasks — completions before this call
+        # (earlier attempts, or announced pre-crash) aren't re-announced.
+        reported, _total, _titles = self._task_progress()
+
+        if self._exit_file().is_file():
+            # Finished while factory was away; collect the recorded outcome.
+            log.info("printer exec already finished for %s; collecting result", rel)
+        elif (pid := self._live_pid()) is not None:
+            log.info("re-attaching to running printer exec for %s (pid %d)",
+                     rel, pid)
+        else:
+            self._spawn(spec_path, resume=resume)
+
+        code = self._wait(on_progress=on_progress, reported=reported)
+        phase = self._phase(spec_path)
+        self._cleanup_state()
+        if code == 0:
+            log.info("printer exec succeeded for %s", rel)
+            return ExecOutcome(True, "all tasks done; review passed", phase or "Done")
+        res = Result(code, "", self._log_tail())
+        reason = self._classify(res, phase)
+        log.warning("printer exec failed for %s: %s", rel, reason)
+        return ExecOutcome(False, reason, phase)
+
+    # --- detached process management --------------------------------------------
+
+    def _state_dir(self) -> Path:
+        return Path(self.repo) / ".printer" / "factory-exec"
+
+    def _pid_file(self) -> Path:
+        return self._state_dir() / "exec.pid"
+
+    def _exit_file(self) -> Path:
+        return self._state_dir() / "exec.exit"
+
+    def _log_file(self) -> Path:
+        return self._state_dir() / "exec.log"
+
+    def exec_active(self) -> bool:
+        """True when a detached exec for this tree is still running, or has
+        finished but its result hasn't been collected yet. While active, the
+        working tree belongs to the agent — callers must not mutate it (no
+        banking commits, base merges, or spec rewrites)."""
+        return self._exit_file().is_file() or self._live_pid() is not None
+
+    def _spawn(self, spec_path: Path, *, resume: bool) -> None:
+        cfg = self.cfg
         args = [cfg.printer_bin, "exec"]
         if resume:
             args.append("--continue")
@@ -77,19 +146,136 @@ class Printer:
             "--model", cfg.agent_model,
             "--max-turns", str(cfg.printer_max_turns),
             "--verbose",
-            # One commit per completed spec task, so the PR shows how the
-            # implementation was built up instead of a single opaque commit.
+            # One commit per completed spec task, pushed immediately, so the
+            # PR shows how the implementation was built up and progress is
+            # retained on GitHub even if the exec dies.
             "--commit-each-task",
+            "--push-each-task",
         ]
-        log.info("printer exec starting for %s", rel)
-        res = run(args, cwd=self.repo)  # inherits no timeout (can run for a while)
-        phase = self._phase(spec_path)
-        if res.ok:
-            log.info("printer exec succeeded for %s", rel)
-            return ExecOutcome(True, "all tasks done; review passed", phase or "Done")
-        reason = self._classify(res, phase)
-        log.warning("printer exec failed for %s: %s", rel, reason)
-        return ExecOutcome(False, reason, phase)
+        state = self._state_dir()
+        state.mkdir(parents=True, exist_ok=True)
+        self._exit_file().unlink(missing_ok=True)
+        # Wrap in `sh` so the exit code is captured on disk even when factory
+        # isn't around to observe it. The temp-then-mv makes its appearance
+        # atomic (a reader never sees an empty exit file).
+        cmd = " ".join(shlex.quote(a) for a in args)
+        exit_tmp = self._exit_file().with_suffix(".tmp")
+        wrapper = (
+            f"{cmd} >> {shlex.quote(str(self._log_file()))} 2>&1; "
+            f"echo $? > {shlex.quote(str(exit_tmp))} && "
+            f"mv {shlex.quote(str(exit_tmp))} {shlex.quote(str(self._exit_file()))}"
+        )
+        proc = subprocess.Popen(  # noqa: S602 - argv is shlex-quoted above
+            ["sh", "-c", wrapper],
+            cwd=str(self.repo),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # own session: survives factory's death
+        )
+        self._pid_file().write_text(str(proc.pid))
+        log.info("printer exec started detached (pid %d), log %s",
+                 proc.pid, self._log_file())
+
+    def _live_pid(self) -> int | None:
+        """Pid of a still-running detached exec for this tree, else None."""
+        try:
+            pid = int(self._pid_file().read_text().strip())
+        except (OSError, ValueError):
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            pass  # exists but owned elsewhere — treat as alive
+        return pid
+
+    def _wait(self, on_progress=None, reported: set[str] | None = None) -> int:
+        """Block until the detached exec finishes; return its exit code.
+        Fires `on_progress` for tasks that transition to done while waiting."""
+        reported = set(reported or ())
+        while True:
+            if self._exit_file().is_file():
+                try:
+                    return int(self._exit_file().read_text().strip())
+                except ValueError:
+                    return 1
+            if self._live_pid() is None:
+                # Re-check: it may have written the exit file and exited
+                # between the two checks above.
+                if self._exit_file().is_file():
+                    continue
+                # Died without writing an exit code (SIGKILL/OOM of the
+                # wrapper itself). Printer's checkpoint still allows resume.
+                log.warning("detached printer exec disappeared without an "
+                            "exit code")
+                return 1
+            if on_progress:
+                done_ids, total, titles = self._task_progress()
+                new = done_ids - reported
+                if new:
+                    reported |= new
+                    try:
+                        on_progress(sorted(titles.get(i, i) for i in new),
+                                    len(done_ids), total)
+                    except Exception as e:  # noqa: BLE001 - progress is best-effort
+                        log.error("progress callback failed: %s", e)
+            time.sleep(self.POLL_SECS)
+
+    def _task_progress(self) -> tuple[set[str], int, dict[str, str]]:
+        """Read printer's task store: (done ids, total tasks, id -> title).
+
+        Task files are TOML frontmatter between `+++` fences; we only need
+        id/title/status, parsed line-wise to avoid a TOML dependency."""
+        tasks_dir = Path(self.repo) / ".printer" / "tasks"
+        done: set[str] = set()
+        titles: dict[str, str] = {}
+        total = 0
+        if not tasks_dir.is_dir():
+            return done, total, titles
+        for f in sorted(tasks_dir.glob("*.md")):
+            tid = title = status = None
+            fences = 0
+            try:
+                for line in f.read_text(errors="replace").splitlines():
+                    if line.strip() == "+++":
+                        fences += 1
+                        if fences == 2:
+                            break  # end of frontmatter; ignore the body
+                        continue
+                    m = re.match(r'^(id|title|status)\s*=\s*"(.*)"\s*$', line)
+                    if m:
+                        if m.group(1) == "id":
+                            tid = m.group(2)
+                        elif m.group(1) == "title":
+                            title = m.group(2)
+                        else:
+                            status = m.group(2)
+            except OSError:
+                continue
+            if tid is None:
+                continue
+            total += 1
+            titles[tid] = title or tid
+            if status == "done":
+                done.add(tid)
+        return done, total, titles
+
+    def _cleanup_state(self) -> None:
+        """Drop pid/exit markers so a later fresh exec in this tree doesn't
+        read stale state. The log is kept for debugging (it lives under
+        `.printer/`, which is excluded from commits and removed with the
+        worktree)."""
+        self._pid_file().unlink(missing_ok=True)
+        self._exit_file().unlink(missing_ok=True)
+
+    def _log_tail(self, lines: int = 60) -> str:
+        try:
+            content = self._log_file().read_text(errors="replace")
+        except OSError:
+            return ""
+        return "\n".join(content.splitlines()[-lines:])
 
     # --- helpers ---------------------------------------------------------------
 
