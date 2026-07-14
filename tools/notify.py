@@ -61,13 +61,17 @@ class Notifier:
             msg["References"] = references or in_reply_to
         msg.set_content(body)
 
+        # Bounded timeout: a hung SMTP connection must never freeze the
+        # single-threaded daemon (progress emails are sent from inside the
+        # exec wait loop).
         try:
             if cfg.smtp_port == 465:
                 ctx = ssl.create_default_context()
-                with smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, context=ctx) as s:
+                with smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, context=ctx,
+                                      timeout=30) as s:
                     self._auth_send(s, msg)
             else:
-                with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as s:
+                with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=30) as s:
                     if cfg.smtp_starttls:
                         s.starttls(context=ssl.create_default_context())
                     self._auth_send(s, msg)

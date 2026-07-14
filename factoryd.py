@@ -16,7 +16,9 @@ import argparse
 import logging
 import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from config import Config
 from pipeline import Pipeline, WorkItem
@@ -57,12 +59,65 @@ class Factory:
             inbox=self.inbox,
             notifier=self.notifier,
             journal=self.journal,
+            # Lets the exec wait loop end promptly on SIGTERM/SIGINT instead
+            # of blocking until the supervisor SIGKILLs us; the detached exec
+            # keeps running and is re-attached on restart.
+            stop_check=lambda: _stop,
         )
         # Same reporting channels, but edits factory's own source instead of the
         # customer repo. Used for items whose title carries the self marker.
         self.self_improver = SelfImprover(
             cfg, linear=self.linear, inbox=self.inbox, notifier=self.notifier
         )
+        # Work items run concurrently, each in its own worktree, so one
+        # multi-hour exec can't block polling or other requests. `_inflight`
+        # (keyed by source:ref) prevents the same item being picked up twice
+        # while a thread is already on it.
+        self.executor = ThreadPoolExecutor(
+            max_workers=max(1, cfg.max_concurrent), thread_name_prefix="item"
+        )
+        self._inflight: dict[str, str] = {}
+        self._inflight_lock = threading.Lock()
+        # Self-updates mutate factory's own source and restart the daemon;
+        # never run two at once.
+        self._self_lock = threading.Lock()
+
+    @staticmethod
+    def _item_key(item: WorkItem) -> str:
+        return f"{item.source}:{item.identifier or item.ref}"
+
+    def _submit(self, item: WorkItem, *, resume: bool = False) -> bool:
+        """Queue an item for processing. Returns False if it's already
+        in flight (dedup across polls and against startup resume)."""
+        key = self._item_key(item)
+        with self._inflight_lock:
+            if key in self._inflight:
+                return False
+            self._inflight[key] = item.title
+
+        def worker() -> None:
+            try:
+                if item.target == "self":
+                    with self._self_lock:
+                        self.self_improver.process(item)
+                else:
+                    self.pipeline.process(item, resume=resume)
+            except Exception as e:  # noqa: BLE001 - one bad item must not kill others
+                log.exception("unhandled error on %s '%s': %s",
+                              item.source, item.title, e)
+                try:
+                    self.notifier.send(
+                        f"factory ERROR: {item.title}",
+                        f"Unhandled exception: {e}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                with self._inflight_lock:
+                    self._inflight.pop(key, None)
+
+        self.executor.submit(worker)
+        return True
 
     def _classify_target(self, title: str) -> tuple[str, str]:
         """Route by the self marker. Returns (target, cleaned_title).
@@ -139,45 +194,33 @@ class Factory:
                     f"Source: {item.source}\n",
                 )
                 continue
+            if item.target == "self":
+                # Self-updates are never auto-resumed: a broken one could
+                # crash-loop the daemon it is modifying. Report instead.
+                self.journal.clear(item)
+                self.notifier.send(
+                    f"factory self-update interrupted: {item.title}",
+                    "A self-update was interrupted mid-run and was NOT "
+                    "resumed automatically. Re-send the request to retry.\n",
+                )
+                continue
             log.info("resuming in-flight %s '%s' (attempt %d/%d)",
                      item.source, item.title, attempt,
                      self.cfg.resume_max_attempts)
-            try:
-                if item.target == "self":
-                    # Self-updates are never auto-resumed: a broken one could
-                    # crash-loop the daemon it is modifying. Report instead.
-                    self.journal.clear(item)
-                    self.notifier.send(
-                        f"factory self-update interrupted: {item.title}",
-                        "A self-update was interrupted mid-run and was NOT "
-                        "resumed automatically. Re-send the request to retry.\n",
-                    )
-                else:
-                    self.pipeline.process(item, resume=True)
-            except Exception as e:  # noqa: BLE001 - a bad resume must not kill startup
-                log.exception("error resuming '%s': %s", item.title, e)
+            self._submit(item, resume=True)
 
     def tick(self) -> int:
         items = self.collect()
+        submitted = 0
         for item in items:
             if _stop:
                 break
-            try:
-                if item.target == "self":
-                    self.self_improver.process(item)
-                else:
-                    self.pipeline.process(item)
-            except Exception as e:  # noqa: BLE001 - one bad item must not kill the loop
-                log.exception("unhandled error on %s '%s': %s",
-                              item.source, item.title, e)
-                try:
-                    self.notifier.send(
-                        f"factory ERROR: {item.title}",
-                        f"Unhandled exception: {e}",
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-        return len(items)
+            if self._submit(item):
+                submitted += 1
+            else:
+                log.debug("skipping %s '%s': already in flight",
+                          item.source, item.title)
+        return submitted
 
     def run_forever(self) -> None:
         cfg = self.cfg
@@ -202,6 +245,10 @@ class Factory:
             while slept < cfg.poll_interval and not _stop:
                 time.sleep(min(2, cfg.poll_interval - slept))
                 slept += 2
+        # Workers see the stop flag through the pipeline's stop_check and wind
+        # down within one exec poll (~5s); detached execs keep running.
+        log.info("factory stopping; waiting for in-flight items to wind down")
+        self.executor.shutdown(wait=True)
         log.info("factory stopped.")
 
 
@@ -263,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         factory.resume_pending()
         n = factory.tick()
+        factory.executor.shutdown(wait=True)
         log.info("single cycle complete (%d item(s)).", n)
         return 0
 

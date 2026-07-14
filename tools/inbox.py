@@ -166,12 +166,14 @@ class Inbox:
         return None
 
     def _connect(self) -> imaplib.IMAP4:
+        # Bounded timeout: a hung IMAP connection must never freeze the
+        # single-threaded daemon's poll loop.
         cfg = self.cfg
         if cfg.imap_port == 143:
-            conn = imaplib.IMAP4(cfg.imap_host, cfg.imap_port)
+            conn = imaplib.IMAP4(cfg.imap_host, cfg.imap_port, timeout=30)
             conn.starttls()
         else:
-            conn = imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port)
+            conn = imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port, timeout=30)
         conn.login(cfg.imap_user, cfg.imap_pass)
         conn.select(cfg.imap_folder)
         return conn

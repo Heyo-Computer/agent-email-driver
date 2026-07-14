@@ -8,6 +8,7 @@ between is identical.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,7 +32,7 @@ class WorkItem:
 
 class Pipeline:
     def __init__(self, cfg, *, git, gh, printer, specgen, linear, inbox, notifier,
-                 journal=None):
+                 journal=None, stop_check=None):
         self.cfg = cfg
         self.git = git
         self.gh = gh
@@ -41,6 +42,12 @@ class Pipeline:
         self.inbox = inbox
         self.notifier = notifier
         self.journal = journal
+        # Callable -> True when the daemon wants to shut down; lets the exec
+        # wait loop end promptly (the detached exec itself keeps running).
+        self.stop_check = stop_check
+        # Worktree add/remove touch the shared main checkout (fetch, prune,
+        # possibly a branch switch); serialize those across item threads.
+        self._main_git_lock = threading.Lock()
 
     # --- naming (deterministic, so restarts re-derive the same branch/spec) ----
 
@@ -72,7 +79,9 @@ class Pipeline:
         # 1. isolated worktree with the item's branch checked out. Each item
         # gets its own checkout (and its own `.printer/` state) so work items
         # can never pollute each other or the main checkout.
-        if not self.git.worktree_add(wt, branch):
+        with self._main_git_lock:
+            wt_ok = self.git.worktree_add(wt, branch)
+        if not wt_ok:
             self._fail(item, None, "could not prepare git worktree")
             return
         git = self.git.for_repo(wt)
@@ -132,7 +141,26 @@ class Pipeline:
         # are surfaced to the requester as they happen so a long run doesn't
         # look dead.
         outcome = printer.exec_spec(
-            spec_path, on_progress=self._progress_cb(item, pr))
+            spec_path,
+            on_progress=self._progress_cb(item, pr, git, branch),
+            stop_check=self.stop_check,
+        )
+
+        if outcome.interrupted:
+            # Shutdown requested while the exec is still running. Push what's
+            # committed so GitHub reflects the progress, tell the owner, and
+            # leave the journal + worktree intact — the restarted daemon
+            # re-attaches to the live exec.
+            git.push(branch)
+            self._notify_owner(
+                item,
+                f"factory stopping: {item.title}",
+                f"factory is shutting down, but the implementation run "
+                f"continues in the background. Committed progress has been "
+                f"pushed to the draft PR:\n{pr}\n\n"
+                f"factory will re-attach when it restarts.\n",
+            )
+            return
 
         # commit + push whatever printer produced (visible on the draft PR)
         git.commit_all(f"factory: implement {item.title}")
@@ -161,18 +189,30 @@ class Pipeline:
 
     # --- notifications ----------------------------------------------------------
 
-    def _progress_cb(self, item: WorkItem, pr: str):
-        """Progress reporter for the exec wait loop: emails the requester
-        in-thread (and posts to Linear) each time tasks complete, so long
-        runs are visibly alive. Failures are logged, never raised — progress
+    def _progress_cb(self, item: WorkItem, pr: str, git, branch: str):
+        """Progress reporter for the exec wait loop: pushes the branch (so
+        the PR on GitHub always reflects committed progress, independent of
+        printer's own per-task push), then emails the requester in-thread
+        (and posts to Linear). Failures are logged, never raised — progress
         reporting must not take down the run."""
         def cb(titles: list[str], done: int, total: int) -> None:
+            # Belt-and-suspenders push: the per-task commits exist locally
+            # even if printer-side pushing is unavailable or failed. A push
+            # failure goes INTO the email — silent staleness on the PR is
+            # exactly how a healthy run looks dead.
+            pushed = git.push(branch)
             finished = "\n".join(f"  - {t}" for t in titles)
-            body = (
-                f"Progress: {done}/{total} tasks complete.\n\n"
-                f"Just finished:\n{finished}\n\n"
+            push_note = (
                 f"Each completed task is committed and pushed — the draft PR "
                 f"has the work so far:\n{pr}\n"
+                if pushed else
+                f"WARNING: pushing to GitHub FAILED — the commits exist only "
+                f"on the factory server. Check /var/log/factory/ for the git "
+                f"error. Draft PR (stale): {pr}\n"
+            )
+            body = (
+                f"Progress: {done}/{total} tasks complete.\n\n"
+                f"Just finished:\n{finished}\n\n{push_note}"
             )
             log.info("progress %d/%d: %s", done, total, "; ".join(titles))
             if item.source == "email" and item.reply_to:
@@ -240,7 +280,8 @@ class Pipeline:
     def _complete(self, item: WorkItem, pr: str) -> None:
         if self.journal:
             self.journal.clear(item)
-        self.git.worktree_remove(self._worktree(item))
+        with self._main_git_lock:
+            self.git.worktree_remove(self._worktree(item))
         msg = f"PR ready for review: {pr}"
         if item.source == "linear":
             self.linear.comment(item.identifier or item.ref, f"✅ {msg}")
@@ -258,7 +299,8 @@ class Pipeline:
         # leaves the journal entry (and its worktree) behind for resume.
         if self.journal:
             self.journal.clear(item)
-        self.git.worktree_remove(self._worktree(item))
+        with self._main_git_lock:
+            self.git.worktree_remove(self._worktree(item))
         log.warning("FAILED %s '%s': %s", item.source, item.title, reason)
         note = f"⚠️ factory could not finish this: {reason}"
         if pr:

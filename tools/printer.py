@@ -56,6 +56,9 @@ class ExecOutcome:
     success: bool
     reason: str          # human-readable summary (blocked reason / error tail)
     phase: str | None    # last checkpoint phase, if discoverable
+    # Factory was asked to shut down while the detached exec was still
+    # running. The exec continues; the item must stay journaled for resume.
+    interrupted: bool = False
 
 
 class Printer:
@@ -75,7 +78,7 @@ class Printer:
     POLL_SECS = 5
 
     def exec_spec(self, spec_path: Path, *, resume: bool = False,
-                  on_progress=None) -> ExecOutcome:
+                  on_progress=None, stop_check=None) -> ExecOutcome:
         """Run `printer exec` for a spec, detached. Blocks until it finishes
         (no wall-clock timeout), but the exec itself survives factory dying:
         on a later call for the same tree we re-attach to the live process or
@@ -83,7 +86,9 @@ class Printer:
 
         `on_progress(titles, done, total)` is called (best-effort) whenever
         tasks newly transition to done while we wait, so the pipeline can
-        surface progress to the requester."""
+        surface progress to the requester. `stop_check()` returning True ends
+        the wait promptly with an `interrupted` outcome — the detached exec
+        keeps running and a later call re-attaches."""
         cfg = self.cfg
         rel = self._rel(spec_path)
         if cfg.dry_run:
@@ -103,8 +108,16 @@ class Printer:
         else:
             self._spawn(spec_path, resume=resume)
 
-        code = self._wait(on_progress=on_progress, reported=reported)
+        code = self._wait(on_progress=on_progress, reported=reported,
+                          stop_check=stop_check)
         phase = self._phase(spec_path)
+        if code is None:
+            log.info("shutdown requested; leaving detached exec running for %s",
+                     rel)
+            return ExecOutcome(False,
+                               "factory shutdown requested; detached exec "
+                               "continues and will be re-attached on restart",
+                               phase, interrupted=True)
         self._cleanup_state()
         if code == 0:
             log.info("printer exec succeeded for %s", rel)
@@ -191,8 +204,10 @@ class Printer:
             pass  # exists but owned elsewhere — treat as alive
         return pid
 
-    def _wait(self, on_progress=None, reported: set[str] | None = None) -> int:
-        """Block until the detached exec finishes; return its exit code.
+    def _wait(self, on_progress=None, reported: set[str] | None = None,
+              stop_check=None) -> int | None:
+        """Block until the detached exec finishes; return its exit code, or
+        None when `stop_check()` asks us to stop waiting (exec keeps running).
         Fires `on_progress` for tasks that transition to done while waiting."""
         reported = set(reported or ())
         while True:
@@ -201,6 +216,8 @@ class Printer:
                     return int(self._exit_file().read_text().strip())
                 except ValueError:
                     return 1
+            if stop_check and stop_check():
+                return None
             if self._live_pid() is None:
                 # Re-check: it may have written the exit file and exited
                 # between the two checks above.
