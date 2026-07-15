@@ -7,6 +7,7 @@ Branch names are deterministic so a crash/restart re-derives the same branch
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from util import Result, log, run
@@ -83,12 +84,17 @@ class Git:
             log.error("git fetch failed")
             return False
         path = Path(path)
-        if (path / ".git").exists():
+        if path.exists():
+            # A valid, registered worktree already on `branch` is reused
+            # (crash-resume keeps its in-flight work). Anything else — wrong
+            # branch, or a stray directory git doesn't recognize as a worktree
+            # (the "already exists / not a working tree" case) — is torn down
+            # so the `worktree add` below can't collide with it.
             res = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path)
-            if res.ok and res.out.strip() == branch:
+            if res.ok and res.out.strip() == branch and (path / ".git").exists():
                 return True
-            log.warning("worktree %s is on %r, not %r; recreating",
-                        path, res.out.strip(), branch)
+            log.warning("worktree %s not a clean checkout of %r (%s); recreating",
+                        path, branch, res.out.strip() or "unrecognized")
             if not self.worktree_remove(path):
                 return False
         # Drop stale registrations (a deleted worktree dir still pins its
@@ -114,20 +120,29 @@ class Git:
         return True
 
     def worktree_remove(self, path: Path) -> bool:
-        """Remove a worktree. Forced — leftover uncommitted junk must not
-        block cleanup (anything worth keeping was committed to the branch,
-        which survives worktree removal)."""
+        """Remove a worktree. Forced — leftover uncommitted junk must not block
+        cleanup (anything worth keeping was committed to the branch, which
+        survives worktree removal). Falls back to a plain directory delete when
+        git doesn't recognize the path as a worktree (a stray/half-created
+        dir), so a later `worktree add` won't collide. Returns True once the
+        path is gone."""
         if self.cfg.dry_run:
             log.info("[dry-run] would remove worktree %s", path)
             return True
-        if not Path(path).exists():
+        path = Path(path)
+        if not path.exists():
             self._git(["worktree", "prune"])
             return True
         res = self._git(["worktree", "remove", "--force", str(path)])
         if not res.ok:
-            log.error("git worktree remove failed: %s", res.err.strip())
-            return False
-        return True
+            # Not a registered worktree (or git refuses): remove the directory
+            # directly, then prune the registration table. The branch and its
+            # commits are unaffected.
+            log.warning("git worktree remove failed (%s); removing dir directly",
+                        res.err.strip())
+            shutil.rmtree(path, ignore_errors=True)
+            self._git(["worktree", "prune"])
+        return not path.exists()
 
     def merge_base(self, branch: str) -> bool:
         """Fold the latest origin/<base> into a reused branch so resumed work

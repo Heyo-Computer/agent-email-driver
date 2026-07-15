@@ -182,7 +182,13 @@ class Factory:
                     # owner's answer — feed it back and resume, don't start new.
                     if self._maybe_answer(t):
                         continue
-                    target, title = self._classify_target(t.subject)
+                    # Derive the title/stem from the de-`Re:`'d subject so a
+                    # reply maps to the SAME branch/worktree as its original
+                    # (a follow-up continues the thread's work) instead of a
+                    # spurious `email-re-...` duplicate. reply_subject keeps the
+                    # raw subject for correct email threading.
+                    target, title = self._classify_target(
+                        _strip_reply_prefixes(t.subject))
                     items.append(
                         WorkItem(
                             source="email",
