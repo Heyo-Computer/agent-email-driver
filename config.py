@@ -82,6 +82,11 @@ class Config:
     # Max work items processed concurrently (each in its own worktree).
     max_concurrent: int
 
+    # Seconds between retries after a transient failure (credits exhausted,
+    # rate limited, provider overloaded). Restarting the daemon retries
+    # immediately regardless.
+    retry_delay: int
+
     # Linear (via the Linear MCP server, reached through `claude -p`)
     linear_team: str
     linear_trigger_state: str
@@ -156,6 +161,7 @@ class Config:
             ).expanduser().resolve(),
             resume_max_attempts=int(_env("FACTORY_RESUME_MAX_ATTEMPTS", "3")),
             max_concurrent=int(_env("FACTORY_MAX_CONCURRENT", "3")),
+            retry_delay=int(_env("FACTORY_RETRY_DELAY", "900")),
             linear_team=_env("FACTORY_LINEAR_TEAM", ""),
             linear_trigger_state=_env("FACTORY_LINEAR_TRIGGER_STATE", "Todo"),
             linear_inprogress_state=_env(

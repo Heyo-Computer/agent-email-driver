@@ -86,7 +86,16 @@ class Factory:
     def _item_key(item: WorkItem) -> str:
         return f"{item.source}:{item.identifier or item.ref}"
 
-    def _submit(self, item: WorkItem, *, resume: bool = False) -> bool:
+    @staticmethod
+    def _item_from_dict(item_dict: dict) -> WorkItem:
+        """Rebuild a WorkItem from a journal entry, tolerating schema drift
+        (unknown keys from an older/newer factory are dropped)."""
+        from dataclasses import fields as dc_fields
+        known = {f.name for f in dc_fields(WorkItem)}
+        return WorkItem(**{k: v for k, v in item_dict.items() if k in known})
+
+    def _submit(self, item: WorkItem, *, resume: bool = False,
+                quiet: bool = False) -> bool:
         """Queue an item for processing. Returns False if it's already
         in flight (dedup across polls and against startup resume)."""
         key = self._item_key(item)
@@ -101,7 +110,7 @@ class Factory:
                     with self._self_lock:
                         self.self_improver.process(item)
                 else:
-                    self.pipeline.process(item, resume=resume)
+                    self.pipeline.process(item, resume=resume, quiet=quiet)
             except Exception as e:  # noqa: BLE001 - one bad item must not kill others
                 log.exception("unhandled error on %s '%s': %s",
                               item.source, item.title, e)
@@ -178,18 +187,16 @@ class Factory:
         bounded number of attempts; past that the item is abandoned with a
         notification instead of crash-looping the daemon.
         """
-        from dataclasses import fields as dc_fields
-        known = {f.name for f in dc_fields(WorkItem)}
-        for item_dict, attempts in self.journal.pending():
-            item = WorkItem(**{k: v for k, v in item_dict.items() if k in known})
+        for item_dict, meta in self.journal.pending():
+            item = self._item_from_dict(item_dict)
             attempt = self.journal.bump(item)
             if attempt > self.cfg.resume_max_attempts:
                 self.journal.clear(item)
                 log.error("giving up on '%s' after %d interrupted attempts",
-                          item.title, attempts)
+                          item.title, meta["attempts"])
                 self.notifier.send(
                     f"factory gave up: {item.title}",
-                    f"This item was interrupted {attempts} times "
+                    f"This item was interrupted {meta['attempts']} times "
                     f"(crash or restart mid-run) and will not be retried.\n"
                     f"Source: {item.source}\n",
                 )
@@ -220,6 +227,19 @@ class Factory:
             else:
                 log.debug("skipping %s '%s': already in flight",
                           item.source, item.title)
+        # Retry items paused on a transient provider failure (credits/rate
+        # limit) whose backoff has elapsed. In-flight dedupe makes this safe
+        # to call every poll.
+        for item_dict, meta in self.journal.due():
+            if _stop:
+                break
+            item = self._item_from_dict(item_dict)
+            if item.target == "self":
+                continue  # self-updates are never auto-retried
+            if self._submit(item, resume=True, quiet=True):
+                submitted += 1
+                log.info("retrying paused item '%s' (deferral %d)",
+                         item.title, meta["deferrals"])
         return submitted
 
     def run_forever(self) -> None:

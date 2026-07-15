@@ -29,6 +29,16 @@ from util import Result, log
 # Scaffold lines like `--- stdout ---` that carry no diagnostic content.
 _SECTION_HEADER = re.compile(r"^-{2,}[^-]*-{2,}$")
 
+# Failure signatures that are TRANSIENT — the request is fine, the provider
+# said "not right now" (credits exhausted, rate limited, overloaded). These
+# runs must be paused and retried, never reported as terminal failures.
+_TRANSIENT = re.compile(
+    r"credit balance|out of credits|insufficient credits|usage limit|"
+    r"rate.?limit|overloaded|quota|billing|too many requests|"
+    r"\b(?:429|529)\b",
+    re.IGNORECASE,
+)
+
 
 def _meaningful_tail(lines: list[str], limit: int = 400) -> str:
     """The most informative line of process output: the last explicit
@@ -59,6 +69,9 @@ class ExecOutcome:
     # Factory was asked to shut down while the detached exec was still
     # running. The exec continues; the item must stay journaled for resume.
     interrupted: bool = False
+    # Failure looks provider-transient (credits/rate limit/overload): the
+    # item should be paused and retried, not reported as terminally failed.
+    transient: bool = False
 
 
 class Printer:
@@ -122,10 +135,13 @@ class Printer:
         if code == 0:
             log.info("printer exec succeeded for %s", rel)
             return ExecOutcome(True, "all tasks done; review passed", phase or "Done")
-        res = Result(code, "", self._log_tail())
+        tail = self._log_tail()
+        res = Result(code, "", tail)
         reason = self._classify(res, phase)
-        log.warning("printer exec failed for %s: %s", rel, reason)
-        return ExecOutcome(False, reason, phase)
+        transient = bool(_TRANSIENT.search(tail))
+        log.warning("printer exec failed for %s%s: %s", rel,
+                    " (transient)" if transient else "", reason)
+        return ExecOutcome(False, reason, phase, transient=transient)
 
     # --- detached process management --------------------------------------------
 

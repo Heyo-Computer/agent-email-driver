@@ -65,7 +65,8 @@ class Pipeline:
 
     # --- orchestration ---------------------------------------------------------
 
-    def process(self, item: WorkItem, *, resume: bool = False) -> None:
+    def process(self, item: WorkItem, *, resume: bool = False,
+                quiet: bool = False) -> None:
         branch, stem = self._names(item)
         wt = self._worktree(item)
         log.info("=== processing%s %s [%s] '%s' -> %s (worktree %s)",
@@ -134,7 +135,7 @@ class Pipeline:
             return
 
         # 4. claim (dedup commit point) + "started" notice
-        self._claim(item, pr, resume=resume)
+        self._claim(item, pr, resume=resume, quiet=quiet)
 
         # 5. execute (inside the worktree) — re-attaches to a live detached
         # exec, collects a finished one, or spawns fresh. Task completions
@@ -167,6 +168,13 @@ class Pipeline:
         git.push(branch)
 
         if not outcome.success:
+            if outcome.transient and self.journal:
+                # Provider said "not right now" (credits/rate limit/overload).
+                # This is a pause, not a failure: keep the journal entry and
+                # worktree, schedule a retry, and say so — the exec resumes
+                # from printer's checkpoint with all completed tasks intact.
+                self._pause(item, pr, outcome.reason)
+                return
             self._fail(item, pr, outcome.reason)
             return
 
@@ -248,7 +256,8 @@ class Pipeline:
 
     # --- per-source claim / completion / failure -------------------------------
 
-    def _claim(self, item: WorkItem, pr: str, *, resume: bool = False) -> None:
+    def _claim(self, item: WorkItem, pr: str, *, resume: bool = False,
+               quiet: bool = False) -> None:
         if item.source == "linear":
             self.linear.set_state(item.identifier or item.ref,
                                   self.cfg.linear_inprogress_state)
@@ -270,6 +279,10 @@ class Pipeline:
                     f"it's ready for review.\n",
                     to=item.reply_to,
                 )
+        if quiet:
+            # Scheduled retry of a paused item: the pause notice already told
+            # everyone; re-announcing every backoff cycle is noise.
+            return
         verb = "resumed" if resume else "started"
         self._notify_owner(
             item,
@@ -292,6 +305,30 @@ class Pipeline:
                         to=item.reply_to)
         self._notify_owner(item, f"factory done: {item.title}", msg)
         log.info("=== done %s '%s' -> %s", item.source, item.title, pr)
+
+    def _pause(self, item: WorkItem, pr: str, reason: str) -> None:
+        """Transient-failure pause: defer the journaled item for retry and
+        notify on the first pause only (a long credit outage must not send an
+        email every retry cycle, but going quiet forever is how the agent
+        looks dead — so every 20th deferral re-notifies)."""
+        delay = self.cfg.retry_delay
+        n = self.journal.defer(item, delay)
+        log.warning("PAUSED %s '%s' (deferral %d, retry in %ds): %s",
+                    item.source, item.title, n, delay, reason)
+        if n == 1 or n % 20 == 0:
+            body = (
+                f"factory hit a temporary provider limit and paused this "
+                f"item:\n\n  {reason}\n\n"
+                f"Completed work is committed and pushed to the draft PR:\n"
+                f"{pr}\n\n"
+                f"It will retry automatically about every "
+                f"{delay // 60} minutes (restarting factory retries "
+                f"immediately). No action needed unless this is a billing "
+                f"issue on the account.\n"
+            )
+            if item.source == "email" and item.reply_to:
+                self._reply(item, body, to=item.reply_to)
+            self._notify_owner(item, f"factory paused: {item.title}", body)
 
     def _fail(self, item: WorkItem, pr: str | None, reason: str) -> None:
         # Reported failures are terminal: the requester is told, so a restart
