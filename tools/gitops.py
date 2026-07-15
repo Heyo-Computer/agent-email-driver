@@ -185,6 +185,35 @@ class Git:
     def has_uncommitted(self) -> bool:
         return bool(self._git(["status", "--porcelain"]).out.strip())
 
+    def add_exclude(self, patterns: list[str]) -> bool:
+        """Add ignore patterns to THIS worktree's private exclude file
+        (`$GIT_DIR/info/exclude`), so they never touch the tracked `.gitignore`
+        and can't leak into a PR. Used to keep factory's `.factory/` scratch
+        (memory, exec state) out of every commit — including printer's
+        `git add -A` per-task commits."""
+        if self.cfg.dry_run:
+            return True
+        res = self._git(["rev-parse", "--git-path", "info/exclude"])
+        if not res.ok:
+            log.error("could not resolve exclude path: %s", res.err.strip())
+            return False
+        exclude = Path(self.repo) / res.out.strip() if not Path(
+            res.out.strip()).is_absolute() else Path(res.out.strip())
+        try:
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            existing = exclude.read_text() if exclude.exists() else ""
+            have = set(existing.splitlines())
+            add = [p for p in patterns if p not in have]
+            if add:
+                with exclude.open("a") as fh:
+                    if existing and not existing.endswith("\n"):
+                        fh.write("\n")
+                    fh.write("\n".join(add) + "\n")
+            return True
+        except OSError as e:  # noqa: BLE001
+            log.error("could not write exclude file %s: %s", exclude, e)
+            return False
+
     def has_changes_beyond(self, base_ref: str, exclude: list[str]) -> bool:
         """Does HEAD change anything vs the merge-base with `base_ref`,
         outside the `exclude`d paths? (The 'did the agent actually implement

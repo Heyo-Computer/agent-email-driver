@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import signal
 import sys
 import threading
@@ -28,12 +29,22 @@ from tools.gitops import Git
 from tools.inbox import Inbox
 from tools.journal import Journal
 from tools.linear_mcp import Linear
-from tools.notify import Notifier
+from tools.memory import Memory
+from tools.notify import Notifier, reply_subject
 from tools.printer import Printer
 from tools.specgen import SpecGen
 from util import log, setup_logging
 
 _stop = False
+
+# Leading reply/forward prefixes (repeated, any case) on an email subject.
+_REPLY_PREFIX = re.compile(r"^\s*(?:(?:re|fwd|fw)\s*:\s*)+", re.IGNORECASE)
+
+
+def _strip_reply_prefixes(subject: str) -> str:
+    """`Re: Fwd: factory: x` -> `factory: x`, so a reply maps to the same
+    title (and thus stem/worktree) as the original trigger."""
+    return _REPLY_PREFIX.sub("", subject or "").strip()
 
 
 def _handle_signal(signum, _frame):
@@ -49,6 +60,7 @@ class Factory:
         self.inbox = Inbox(cfg)
         self.notifier = Notifier(cfg)
         self.journal = Journal(cfg)
+        self.memory = Memory(cfg)
         self.pipeline = Pipeline(
             cfg,
             git=Git(cfg),
@@ -59,6 +71,7 @@ class Factory:
             inbox=self.inbox,
             notifier=self.notifier,
             journal=self.journal,
+            memory=self.memory,
             # Lets the exec wait loop end promptly on SIGTERM/SIGINT instead
             # of blocking until the supervisor SIGKILLs us; the detached exec
             # keeps running and is re-attached on restart.
@@ -184,42 +197,88 @@ class Factory:
         return items
 
     def _maybe_nudge(self, trigger) -> bool:
-        """If `trigger` is a nudge (contains a nudge marker AND threads to a
-        currently in-flight journaled item), kick that run and consume the
-        email. Returns True when handled. A brand-new email mentioning "nudge"
-        won't match any thread, so it flows through as normal work."""
-        from tools.inbox import _has_directive, _msgids
-        if not _has_directive(trigger.subject, trigger.body,
-                              self.cfg.imap_nudge_markers):
+        """If `trigger` is a nudge for an existing run, kick that run and
+        consume the email. Returns True when handled; False lets the trigger
+        flow through as normal work.
+
+        A trigger is a nudge when its OWN text (not quoted thread history)
+        carries a nudge marker AND it maps to an existing run. Mapping is by
+        the deterministic subject→stem→worktree the pipeline already uses
+        (robust to mail threading), with a message-id fallback. A brand-new
+        email on a new subject maps to no existing worktree, so it stays
+        normal work even if it says "nudge"."""
+        from tools.inbox import _has_directive
+        # Check the marker against the reply's OWN body (fall back to the
+        # folded body for older triggers), never the quoted thread history.
+        own = getattr(trigger, "own_body", "") or trigger.body
+        if not _has_directive(trigger.subject, own, self.cfg.imap_nudge_markers):
             return False
-        refs = set(_msgids(trigger.references))
-        target = None
-        for item_dict, _meta in self.journal.pending():
-            mid = item_dict.get("reply_msgid")
-            if mid and mid in refs:
-                target = self._item_from_dict(item_dict)
-                break
-        if target is None:
+        target = self._reply_target(trigger)
+        # A message whose own text is essentially just "nudge" is a nudge, full
+        # stop — never a new spec. If there's nothing to nudge, say so instead
+        # of surprising the user with a brand-new PR. A substantial body that
+        # merely mentions "nudge" with no matching run is left as normal work.
+        pure = len(own.strip()) <= 50
+        if target is None and not pure:
+            log.info("nudge marker in substantial reply '%s' with no matching "
+                     "run; treating as normal work", trigger.subject)
             return False
         self.inbox.mark_seen(trigger.uid)
+        if target is None:
+            log.info("pure nudge '%s' but no active run to kick", trigger.subject)
+            if trigger.sender:
+                self.notifier.send(
+                    reply_subject(trigger.subject),
+                    "Got your nudge, but there's no run to kick — it looks "
+                    "finished or was never started. Reply with a fresh request "
+                    "to start new work.\n",
+                    to=trigger.sender, in_reply_to=trigger.message_id or None,
+                    references=trigger.references or None,
+                )
+            return True
         ok = self.pipeline.request_nudge(target)
-        log.info("nudge reply for '%s': %s", target.title,
+        log.info("nudge for '%s': %s", target.title,
                  "signalled" if ok else "no active run")
         body = (
-            f"Got your nudge. The run was kicked — it will restart from its "
-            f"last checkpoint and keep going.\n"
+            "Got your nudge — the run was kicked and will resume from its last "
+            "checkpoint.\n"
             if ok else
-            f"Got your nudge, but there's no active run to kick right now "
-            f"(it may be paused or already finished). If it's paused it will "
-            f"retry on its own.\n"
+            "Got your nudge, but there's no active run to kick right now (it "
+            "may be paused or already finished). A paused run retries on its "
+            "own; reply with a fresh request to start over.\n"
         )
         if trigger.sender:
             self.notifier.send(
-                f"Re: {trigger.subject}", body, to=trigger.sender,
+                reply_subject(trigger.subject), body, to=trigger.sender,
                 in_reply_to=trigger.message_id or None,
                 references=trigger.references or None,
             )
         return True
+
+    def _reply_target(self, trigger) -> WorkItem | None:
+        """The existing run a nudge reply refers to, or None. Primary match:
+        the de-`Re:`'d subject yields the same stem/worktree the original run
+        used and that worktree still exists. Fallback: the reply's message-id
+        chain matches a journaled item."""
+        from tools.inbox import _msgids
+        subj = _strip_reply_prefixes(trigger.subject)
+        target_kind, title = self._classify_target(subj)
+        synth = WorkItem(
+            source="email", title=title, body="", ref=trigger.uid,
+            reply_to=trigger.sender, reply_msgid=trigger.message_id,
+            reply_refs=trigger.references, reply_subject=subj,
+            target=target_kind,
+        )
+        # Primary: subject-derived worktree exists (an active or paused run).
+        if target_kind != "self" and self.pipeline._worktree(synth).exists():
+            return synth
+        # Fallback: message-id references vs journaled in-flight items.
+        refs = set(_msgids(trigger.references))
+        for item_dict, _meta in self.journal.pending():
+            mid = item_dict.get("reply_msgid")
+            if mid and mid in refs:
+                return self._item_from_dict(item_dict)
+        return None
 
     def resume_pending(self) -> None:
         """Re-queue work interrupted by a crash/restart (journal leftovers).

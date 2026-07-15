@@ -44,6 +44,9 @@ class Trigger:
     body: str
     message_id: str       # for In-Reply-To threading on the SMTP reply
     references: str = ""  # full thread chain (References + own id), space-joined
+    own_body: str = ""    # this message's own text, BEFORE thread context is
+                          # folded into `body` (so a nudge check isn't fooled
+                          # by "nudge" quoted from an earlier message)
 
 
 def _decode(value: str | None) -> str:
@@ -261,6 +264,7 @@ class Inbox:
                 sender = parseaddr(sender_full)[1].lower()
                 subject = _decode(msg.get("Subject")).strip() or "(no subject)"
                 body = _plain_body(msg).strip()
+                own_body = body  # before thread context is folded in
                 reason = self._triage_reject(sender, subject, body)
                 if reason:
                     # Leave the message UNSEEN so a later allowlist/marker fix
@@ -299,6 +303,7 @@ class Inbox:
                         body=body,
                         message_id=own_mid,
                         references=" ".join(chain),
+                        own_body=own_body,
                     )
                 )
         finally:

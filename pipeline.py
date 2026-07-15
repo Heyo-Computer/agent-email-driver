@@ -32,7 +32,7 @@ class WorkItem:
 
 class Pipeline:
     def __init__(self, cfg, *, git, gh, printer, specgen, linear, inbox, notifier,
-                 journal=None, stop_check=None):
+                 journal=None, stop_check=None, memory=None):
         self.cfg = cfg
         self.git = git
         self.gh = gh
@@ -42,6 +42,7 @@ class Pipeline:
         self.inbox = inbox
         self.notifier = notifier
         self.journal = journal
+        self.memory = memory
         # Callable -> True when the daemon wants to shut down; lets the exec
         # wait loop end promptly (the detached exec itself keeps running).
         self.stop_check = stop_check
@@ -62,6 +63,14 @@ class Pipeline:
     def _worktree(self, item: WorkItem) -> Path:
         _branch, stem = self._names(item)
         return self.cfg.worktrees_dir / stem
+
+    def _append_memory(self, spec_path: Path, mem_index: str) -> None:
+        """Append the working-memory section to a freshly written spec."""
+        try:
+            with spec_path.open("a") as fh:
+                fh.write(f"\n\n---\n\n{mem_index}")
+        except OSError as e:  # noqa: BLE001
+            log.error("could not append memory to spec: %s", e)
 
     # --- orchestration ---------------------------------------------------------
 
@@ -87,6 +96,15 @@ class Pipeline:
             return
         git = self.git.for_repo(wt)
         printer = self.printer.for_repo(wt)
+
+        # Keep factory's scratch (memory, exec state) out of every commit —
+        # including printer's per-task `git add -A` — via the worktree's
+        # private exclude, then stage the durable memory store into the tree
+        # for the agent to recall from.
+        mem_index = ""
+        if self.memory:
+            git.add_exclude([".factory/"])
+            mem_index = self.memory.install(wt)
 
         # A detached exec may have kept running (or finished) while factory
         # was down. While one is active the tree belongs to the agent: skip
@@ -117,6 +135,8 @@ class Pipeline:
         spec_path = wt / self.cfg.specs_dir / f"{stem}.md"
         if not spec_path.is_file():
             self.specgen.write_spec(spec_path, title=item.title, body=item.body)
+            if mem_index:
+                self._append_memory(spec_path, mem_index)
         rel_spec = f"{self.cfg.specs_dir}/{spec_path.name}"
         if not git.commit_paths([rel_spec], f"factory: spec for {item.title}"):
             self._fail(item, None, "could not commit spec")
@@ -163,6 +183,18 @@ class Pipeline:
                 f"factory will re-attach when it restarts.\n",
             )
             return
+
+        # Harvest anything the agent learned this run into the durable store
+        # (idempotent + deduped). Skipped above for `interrupted` because the
+        # detached exec is still live and may be mid-write to the inbox.
+        if self.memory:
+            try:
+                n = self.memory.harvest(wt)
+                if n:
+                    log.info("memory: harvested %d learning(s) from '%s'",
+                             n, item.title)
+            except Exception as e:  # noqa: BLE001 - memory must not fail a run
+                log.error("memory harvest failed: %s", e)
 
         # commit + push whatever printer produced (visible on the draft PR)
         git.commit_all(f"factory: implement {item.title}")

@@ -87,6 +87,11 @@ class Config:
     # immediately regardless.
     retry_delay: int
 
+    # Persistent memory: durable learnings recalled into future runs.
+    memory_enabled: bool
+    memory_dir: Path        # root; per-repo subdirs live under it
+    memory_max_inject: int  # cap on index lines injected into a spec
+
     # Nudge a wedged exec (kill + resume from checkpoint) when it makes no
     # real progress for this many seconds. 0 disables auto-nudging.
     stall_timeout: int
@@ -172,6 +177,12 @@ class Config:
             resume_max_attempts=int(_env("FACTORY_RESUME_MAX_ATTEMPTS", "3")),
             max_concurrent=int(_env("FACTORY_MAX_CONCURRENT", "3")),
             retry_delay=int(_env("FACTORY_RETRY_DELAY", "900")),
+            memory_enabled=_env("FACTORY_MEMORY_ENABLED", "1")
+            not in ("0", "false", "no"),
+            memory_dir=Path(
+                _env("FACTORY_MEMORY_DIR", "~/.factory/memory")
+            ).expanduser().resolve(),
+            memory_max_inject=int(_env("FACTORY_MEMORY_MAX_INJECT", "60")),
             stall_timeout=int(_env("FACTORY_STALL_TIMEOUT", "1800")),
             max_nudges=int(_env("FACTORY_MAX_NUDGES", "3")),
             imap_nudge_markers=_csv("FACTORY_IMAP_NUDGE_MARKERS") or ["nudge"],
