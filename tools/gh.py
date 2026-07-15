@@ -81,3 +81,31 @@ class Gh:
 
     def auth_ok(self) -> bool:
         return run(["gh", "auth", "status"]).ok
+
+    def bot_login(self) -> str:
+        """The authenticated gh account's login (factory's own identity), so we
+        can skip factory's own PR comments when scanning for owner answers.
+        Cached; empty string if it can't be determined."""
+        if getattr(self, "_bot_login", None) is None:
+            res = self._gh(["api", "user", "--jq", ".login"])
+            self._bot_login = res.out.strip() if res.ok else ""
+        return self._bot_login
+
+    def list_comments(self, pr: str) -> list[tuple[str, str, str]]:
+        """Return (id, author_login, body) for each comment on the PR, oldest
+        first. Empty on error — comment polling must never crash the loop."""
+        import json as _json
+        res = self._gh(["pr", "view", pr, "--json", "comments"])
+        if not res.ok:
+            log.debug("gh pr view comments failed for %s: %s", pr, res.err.strip())
+            return []
+        try:
+            data = _json.loads(res.out or "{}")
+        except ValueError:
+            return []
+        out = []
+        for c in data.get("comments", []):
+            cid = str(c.get("id") or c.get("url") or "")
+            author = (c.get("author") or {}).get("login", "")
+            out.append((cid, author, c.get("body", "")))
+        return out

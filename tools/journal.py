@@ -35,7 +35,8 @@ class Journal:
         """Persist `item` as in-flight. Keeps the attempt and deferral counts
         of an earlier entry for the same item (a resume must not reset its
         crash budget, and a retry cycle must not look like a first pause).
-        The retry_at schedule is dropped — the item is being attempted now."""
+        Transient state — retry_at schedule and awaiting-answer — is dropped:
+        the item is being attempted now."""
         if self.cfg.dry_run:
             return
         path = self._path(item)
@@ -55,6 +56,67 @@ class Journal:
             ))
         except Exception as e:  # noqa: BLE001 - journaling must not block work
             log.error("journal: could not record %s: %s", path.name, e)
+
+    def block_on_answer(self, item, pr: str, question: str) -> None:
+        """Mark a journaled item as awaiting an owner answer. It is NOT retried
+        on a timer (an answerless retry just re-blocks); it waits until an
+        answer arrives via email or PR comment. `seen_comment_ids` tracks PR
+        comments already considered, so the poller only acts on new ones."""
+        path = self._path(item)
+        try:
+            data = json.loads(path.read_text()) if path.is_file() else {
+                "item": asdict(item)}
+        except Exception:  # noqa: BLE001
+            data = {"item": asdict(item)}
+        data["awaiting_answer"] = True
+        data["pr"] = pr
+        data["question"] = question
+        data.setdefault("seen_comment_ids", [])
+        data.pop("retry_at", None)
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, indent=2))
+        except Exception as e:  # noqa: BLE001
+            log.error("journal: could not block %s: %s", path.name, e)
+
+    def mark_comments_seen(self, item, ids: list) -> None:
+        """Record PR comment ids the answer-poller has already examined."""
+        path = self._path(item)
+        try:
+            data = json.loads(path.read_text())
+        except Exception:  # noqa: BLE001
+            return
+        seen = set(data.get("seen_comment_ids", []))
+        seen.update(ids)
+        data["seen_comment_ids"] = sorted(seen)
+        try:
+            path.write_text(json.dumps(data, indent=2))
+        except Exception as e:  # noqa: BLE001
+            log.error("journal: could not update seen comments %s: %s",
+                      path.name, e)
+
+    def clear_awaiting(self, item) -> None:
+        """Drop the awaiting-answer flag (an answer is being delivered) so a
+        concurrent poll won't deliver it twice."""
+        path = self._path(item)
+        try:
+            data = json.loads(path.read_text())
+        except Exception:  # noqa: BLE001
+            return
+        data.pop("awaiting_answer", None)
+        try:
+            path.write_text(json.dumps(data, indent=2))
+        except Exception as e:  # noqa: BLE001
+            log.error("journal: could not clear awaiting %s: %s", path.name, e)
+
+    def awaiting(self) -> list[tuple[dict, dict]]:
+        """Entries blocked on an owner answer: (item_dict, meta) where meta has
+        `pr`, `question`, `seen_comment_ids`."""
+        out = []
+        for item, meta in self.pending():
+            if meta.get("awaiting_answer"):
+                out.append((item, meta))
+        return out
 
     def bump(self, item) -> int:
         """Increment and return the attempt count (called before a resume)."""
@@ -108,6 +170,10 @@ class Journal:
                     "attempts": data.get("attempts", 0),
                     "deferrals": data.get("deferrals", 0),
                     "retry_at": data.get("retry_at"),
+                    "awaiting_answer": data.get("awaiting_answer", False),
+                    "pr": data.get("pr", ""),
+                    "question": data.get("question", ""),
+                    "seen_comment_ids": data.get("seen_comment_ids", []),
                 }
                 out.append((f.stat().st_mtime, data["item"], meta))
             except Exception as e:  # noqa: BLE001
@@ -121,7 +187,10 @@ class Journal:
 
     def due(self) -> list[tuple[dict, dict]]:
         """Deferred entries whose retry time has arrived — the poll loop
-        retries these (a daemon restart retries everything regardless)."""
+        retries these (a daemon restart retries everything regardless).
+        Items awaiting an owner answer are excluded: they wait for the answer,
+        not a timer."""
         now = time.time()
         return [(item, meta) for item, meta in self.pending()
-                if meta["retry_at"] is not None and meta["retry_at"] <= now]
+                if not meta.get("awaiting_answer")
+                and meta["retry_at"] is not None and meta["retry_at"] <= now]

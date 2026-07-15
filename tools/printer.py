@@ -85,6 +85,11 @@ class ExecOutcome:
     # The exec wedged and automatic nudges could not clear it: pause and
     # retry fresh later, like a transient failure.
     stalled: bool = False
+    # The agent reported blocked on a decision only the owner can make. Not a
+    # failure: keep the work resumable and wait for an answer, don't auto-retry
+    # (retrying without an answer just re-blocks). `question` holds the ask.
+    blocked: bool = False
+    question: str = ""
 
 
 class Printer:
@@ -160,9 +165,29 @@ class Printer:
         res = Result(code, "", tail)
         reason = self._classify(res, phase)
         transient = bool(_TRANSIENT.search(tail))
+        question = self._blocked_question(tail)
+        if question:
+            log.warning("printer exec blocked for %s: %s", rel, question)
+            return ExecOutcome(False, reason, phase, blocked=True,
+                               question=question)
         log.warning("printer exec failed for %s%s: %s", rel,
                     " (transient)" if transient else "", reason)
         return ExecOutcome(False, reason, phase, transient=transient)
+
+    def _blocked_question(self, tail: str) -> str:
+        """Extract the agent's blocking question from the output, or "" if the
+        exec didn't end blocked. Printer prints `<<BLOCKED: reason>>`; the
+        reason is the decision the owner needs to make."""
+        if "<<BLOCKED" not in tail:
+            return ""
+        # Prefer the sentinel payload; fall back to the last BLOCK-ish line.
+        m = re.search(r"<<BLOCKED:\s*(.*?)>>", tail, re.S)
+        if m and m.group(1).strip():
+            return " ".join(m.group(1).split())[:800]
+        for line in reversed([ln.strip() for ln in tail.splitlines() if ln.strip()]):
+            if "BLOCK" in line.upper():
+                return line[:800]
+        return "the agent reported blocked but gave no reason"
 
     # --- detached process management --------------------------------------------
 

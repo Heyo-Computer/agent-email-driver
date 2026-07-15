@@ -178,6 +178,10 @@ class Factory:
                     # kicks that run rather than starting a new one.
                     if self._maybe_nudge(t):
                         continue
+                    # A reply threaded to an item blocked on a decision is the
+                    # owner's answer — feed it back and resume, don't start new.
+                    if self._maybe_answer(t):
+                        continue
                     target, title = self._classify_target(t.subject)
                     items.append(
                         WorkItem(
@@ -280,6 +284,95 @@ class Factory:
                 return self._item_from_dict(item_dict)
         return None
 
+    # --- unblocking: owner answers via email reply or PR comment ----------------
+
+    def _awaiting_match(self, trigger):
+        """The journaled item AWAITING an answer that this reply refers to,
+        matched by subject→worktree or message-id, plus its meta. (None, None)
+        if no awaiting item matches."""
+        from tools.inbox import _msgids
+        subj = _strip_reply_prefixes(trigger.subject)
+        kind, title = self._classify_target(subj)
+        synth = WorkItem(source="email", title=title, body="", target=kind, ref="x")
+        want_wt = self.pipeline._worktree(synth)
+        refs = set(_msgids(trigger.references))
+        for item_dict, meta in self.journal.awaiting():
+            it = self._item_from_dict(item_dict)
+            if self.pipeline._worktree(it) == want_wt:
+                return it, meta
+            if it.reply_msgid and it.reply_msgid in refs:
+                return it, meta
+        return None, None
+
+    def _maybe_answer(self, trigger) -> bool:
+        """If this reply is the owner's answer to a blocked item, deliver it and
+        resume. Returns True when handled."""
+        target, meta = self._awaiting_match(trigger)
+        if target is None:
+            return False
+        answer = (getattr(trigger, "own_body", "") or trigger.body).strip()
+        if not answer:
+            return False
+        self.inbox.mark_seen(trigger.uid)
+        self._deliver_answer(target, meta, answer, via="email reply",
+                             trigger=trigger)
+        return True
+
+    def _poll_pr_answers(self) -> None:
+        """Scan the PRs of items awaiting a decision for a new owner comment;
+        the first non-factory comment is taken as the answer."""
+        bot = ""
+        try:
+            bot = self.pipeline.gh.bot_login()
+        except Exception:  # noqa: BLE001
+            pass
+        for item_dict, meta in self.journal.awaiting():
+            pr = meta.get("pr")
+            if not pr:
+                continue
+            item = self._item_from_dict(item_dict)
+            try:
+                comments = self.pipeline.gh.list_comments(pr)
+            except Exception as e:  # noqa: BLE001
+                log.debug("could not read PR comments for %s: %s", pr, e)
+                continue
+            seen = set(meta.get("seen_comment_ids", []))
+            new_ids, answer = [], None
+            for cid, author, cbody in comments:
+                if cid in seen:
+                    continue
+                new_ids.append(cid)
+                if author and author == bot:
+                    continue  # factory's own question comment
+                if cbody.strip():
+                    answer = cbody.strip()
+                    break
+            if new_ids:
+                self.journal.mark_comments_seen(item, new_ids)
+            if answer:
+                self._deliver_answer(item, meta, answer, via="PR comment")
+
+    def _deliver_answer(self, item, meta, answer: str, *, via: str,
+                        trigger=None) -> None:
+        """Inject an answer into the run and resume it. Clears the awaiting
+        flag first so a concurrent poll can't deliver twice."""
+        self.journal.clear_awaiting(item)
+        ok = self.pipeline.apply_answer(item, answer, meta.get("question", ""))
+        log.info("answer for '%s' via %s: %s", item.title, via,
+                 "applied, resuming" if ok else "no workspace to resume")
+        if ok:
+            self._submit(item, resume=True, quiet=True)
+        if trigger is not None and trigger.sender:
+            ack = ("Thanks — feeding your answer to the agent and resuming from "
+                   "where it stopped.\n" if ok else
+                   "Got your answer, but the run's workspace is no longer "
+                   "available; reply with a fresh request to restart.\n")
+            self.notifier.send(
+                reply_subject(trigger.subject), ack, to=trigger.sender,
+                in_reply_to=trigger.message_id or None,
+                references=trigger.references or None,
+            )
+
     def resume_pending(self) -> None:
         """Re-queue work interrupted by a crash/restart (journal leftovers).
 
@@ -290,6 +383,12 @@ class Factory:
         """
         for item_dict, meta in self.journal.pending():
             item = self._item_from_dict(item_dict)
+            if meta.get("awaiting_answer"):
+                # Blocked on an owner decision — waits for an answer, not a
+                # restart. Leave it parked (the answer pollers pick it up).
+                log.info("'%s' is awaiting an owner answer; not auto-resuming",
+                         item.title)
+                continue
             attempt = self.journal.bump(item)
             if attempt > self.cfg.resume_max_attempts:
                 self.journal.clear(item)
@@ -341,6 +440,13 @@ class Factory:
                 submitted += 1
                 log.info("retrying paused item '%s' (deferral %d)",
                          item.title, meta["deferrals"])
+        # Owner answers posted as PR comments (the email channel is handled in
+        # collect() via the inbox triggers).
+        if not _stop:
+            try:
+                self._poll_pr_answers()
+            except Exception as e:  # noqa: BLE001
+                log.exception("error polling PR answers: %s", e)
         return submitted
 
     def run_forever(self) -> None:

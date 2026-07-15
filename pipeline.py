@@ -201,6 +201,12 @@ class Pipeline:
         pushed = git.push(branch)
 
         if not outcome.success:
+            if outcome.blocked and self.journal:
+                # The agent needs an owner decision. Not a failure: keep the
+                # work resumable and wait for an answer (email reply or PR
+                # comment), then resume from the checkpoint.
+                self._await_answer(item, pr, outcome.question or outcome.reason)
+                return
             if (outcome.transient or outcome.stalled) and self.journal:
                 # Not a real failure: either the provider said "not right now"
                 # (credits/rate limit/overload), or the exec wedged and
@@ -400,6 +406,65 @@ class Pipeline:
             if item.source == "email" and item.reply_to:
                 self._reply(item, body, to=item.reply_to)
             self._notify_owner(item, f"factory paused: {item.title}", body)
+
+    def _await_answer(self, item: WorkItem, pr: str, question: str) -> None:
+        """Park a blocked item until the owner answers. Keeps the journal entry
+        and worktree (resumable), surfaces the question on the PR and in-thread,
+        and does NOT mark ready or auto-retry."""
+        self.journal.block_on_answer(item, pr, question)
+        log.warning("BLOCKED %s '%s' awaiting owner answer: %s",
+                    item.source, item.title, question)
+        self.gh.comment(
+            pr,
+            f"⏸️ **factory needs a decision to continue**\n\n> {question}\n\n"
+            f"Reply to the factory email thread, or comment here with your "
+            f"answer, and factory will feed it back to the agent and resume "
+            f"from where it stopped.")
+        body = (
+            f"The agent stopped and needs a decision from you before it can "
+            f"continue:\n\n  {question}\n\n"
+            f"Reply to this email with your answer (or comment on the PR) and "
+            f"factory will resume from where it left off — completed work is "
+            f"kept. Draft PR:\n{pr}\n"
+        )
+        if item.source == "email" and item.reply_to:
+            self._reply(item, body, to=item.reply_to)
+        elif item.source == "linear":
+            self.linear.comment(item.identifier or item.ref,
+                                f"⏸️ needs a decision to continue: {question}")
+        self._notify_owner(item, f"factory needs a decision: {item.title}", body)
+
+    def apply_answer(self, item: WorkItem, answer: str, question: str = "") -> bool:
+        """Inject an owner's answer into the worktree spec and commit it, so a
+        subsequent resume feeds it to the agent. Returns False if the worktree
+        is gone (nothing to resume)."""
+        wt = self._worktree(item)
+        if not wt.exists():
+            return False
+        _branch, stem = self._names(item)
+        spec_path = wt / self.cfg.specs_dir / f"{stem}.md"
+        if not spec_path.is_file():
+            return False
+        section = (
+            "\n\n---\n\n## Owner decision (resolves a blocker)\n\n"
+            + (f"**Question:** {question}\n\n" if question else "")
+            + f"**Answer:** {answer.strip()}\n\n"
+            "Incorporate this decision and continue. Un-block any task that was "
+            "waiting on it (`printer task start <id>`), then proceed.\n"
+        )
+        try:
+            with spec_path.open("a") as fh:
+                fh.write(section)
+        except OSError as e:  # noqa: BLE001
+            log.error("could not write answer to spec: %s", e)
+            return False
+        git = self.git.for_repo(wt)
+        git.add_exclude([".factory/"])
+        rel = f"{self.cfg.specs_dir}/{spec_path.name}"
+        git.commit_paths([rel], f"factory: owner answer for {item.title}")
+        git.push(_branch)
+        log.info("applied owner answer to '%s'", item.title)
+        return True
 
     def _nudge_cb(self, item: WorkItem, pr: str, git, branch: str):
         """Reporter fired when a wedged exec is nudged (killed + resumed from
