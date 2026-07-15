@@ -196,9 +196,9 @@ class Pipeline:
             except Exception as e:  # noqa: BLE001 - memory must not fail a run
                 log.error("memory harvest failed: %s", e)
 
-        # commit + push whatever printer produced (visible on the draft PR)
+        # commit + push whatever the agent produced (visible on the draft PR)
         git.commit_all(f"factory: implement {item.title}")
-        git.push(branch)
+        pushed = git.push(branch)
 
         if not outcome.success:
             if (outcome.transient or outcome.stalled) and self.journal:
@@ -226,6 +226,21 @@ class Pipeline:
                        "beyond the spec")
             return
 
+        # HARD GATE: never mark a PR ready unless GitHub verifiably has the
+        # commits. A silently-failed push must not present as "ready for
+        # review". Treat a push that didn't land as retryable (usually
+        # transient/network; a persistent auth issue surfaces via deferral
+        # notices) rather than a terminal failure.
+        if not self.cfg.dry_run and (not pushed or git.unpushed(branch) != 0):
+            reason = ("commits could not be pushed to GitHub (the work is "
+                      "committed on the factory server but the push did not "
+                      "land)")
+            if self.journal:
+                self._pause(item, pr, reason, cause="a GitHub push failure")
+            else:
+                self._fail(item, pr, reason)
+            return
+
         # 6. ready for review
         self.gh.mark_ready(pr)
 
@@ -234,38 +249,56 @@ class Pipeline:
 
     # --- notifications ----------------------------------------------------------
 
-    def _progress_cb(self, item: WorkItem, pr: str, git, branch: str):
-        """Progress reporter for the exec wait loop: pushes the branch (so
-        the PR on GitHub always reflects committed progress, independent of
-        printer's own per-task push), then emails the requester in-thread
-        (and posts to Linear). Failures are logged, never raised — progress
-        reporting must not take down the run."""
-        def cb(titles: list[str], done: int, total: int) -> None:
-            # Belt-and-suspenders push: the per-task commits exist locally
-            # even if printer-side pushing is unavailable or failed. A push
-            # failure goes INTO the email — silent staleness on the PR is
-            # exactly how a healthy run looks dead.
-            pushed = git.push(branch)
-            finished = "\n".join(f"  - {t}" for t in titles)
-            push_note = (
-                f"Each completed task is committed and pushed — the draft PR "
-                f"has the work so far:\n{pr}\n"
-                if pushed else
-                f"WARNING: pushing to GitHub FAILED — the commits exist only "
-                f"on the factory server. Check /var/log/factory/ for the git "
-                f"error. Draft PR (stale): {pr}\n"
+    def _push_verified(self, git, branch: str,
+                       message: str = "factory: task progress") -> tuple[bool, str]:
+        """Commit the worktree, push, and VERIFY the remote actually advanced.
+        Returns (ok, human note). factory is the sole committer/pusher, so this
+        is the one place that decides whether GitHub really has the work — the
+        email never claims 'pushed' on faith."""
+        committed = git.commit_all(message)
+        pushed = git.push(branch)
+        unpushed = git.unpushed(branch) if pushed else -1
+        beyond = git.commits_beyond(f"origin/{self.cfg.base_branch}")
+        ok = pushed and unpushed == 0
+        if not ok:
+            return False, (
+                f"WARNING: commits are NOT on GitHub yet — the push "
+                f"{'failed' if not pushed else 'did not fully land'} "
+                f"(unpushed={unpushed}). The work is safe on the factory "
+                f"server; check /var/log/factory/ for the git error."
             )
+        if beyond <= 1:
+            # Pushed cleanly, but nothing beyond the spec commit exists — the
+            # agent marked tasks done without producing committed changes.
+            return False, (
+                "WARNING: tasks are being marked done but NO code has been "
+                "committed to the branch yet — the run may not be writing "
+                "files, or writing only ignored paths."
+            )
+        return True, f"{beyond - 1} implementation commit(s) are on the draft PR."
+
+    def _progress_cb(self, item: WorkItem, pr: str, git, branch: str):
+        """Progress reporter for the exec wait loop. On each task completion it
+        commits, pushes, and verifies the remote advanced, then reports the
+        VERIFIED state (never a bare 'pushed' claim). Best-effort; never raises
+        into the wait loop."""
+        def cb(titles: list[str], done: int, total: int) -> None:
+            msg = f"factory: complete task(s): {'; '.join(titles)}"[:200]
+            ok, note = self._push_verified(git, branch, message=msg)
+            finished = "\n".join(f"  - {t}" for t in titles)
             body = (
                 f"Progress: {done}/{total} tasks complete.\n\n"
-                f"Just finished:\n{finished}\n\n{push_note}"
+                f"Just finished:\n{finished}\n\n{note}\n\nDraft PR:\n{pr}\n"
             )
-            log.info("progress %d/%d: %s", done, total, "; ".join(titles))
+            log.info("progress %d/%d (%s): %s", done, total,
+                     "pushed" if ok else "NOT pushed", "; ".join(titles))
             if item.source == "email" and item.reply_to:
                 self._reply(item, body, to=item.reply_to)
             elif item.source == "linear":
+                flag = "" if ok else " ⚠️ not pushed"
                 self.linear.comment(item.identifier or item.ref,
-                                    f"⏳ {done}/{total} tasks done — latest: "
-                                    f"{'; '.join(titles)}")
+                                    f"⏳ {done}/{total} tasks done{flag} — "
+                                    f"latest: {'; '.join(titles)}")
             self._notify_owner(item, f"factory progress: {item.title}", body)
         return cb
 

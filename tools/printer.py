@@ -211,12 +211,12 @@ class Printer:
             "--model", cfg.agent_model,
             "--max-turns", str(cfg.printer_max_turns),
             "--verbose",
-            # One commit per completed spec task, pushed immediately, so the
-            # PR shows how the implementation was built up and progress is
-            # retained on GitHub even if the exec dies.
-            "--commit-each-task",
-            "--push-each-task",
         ]
+        # NOTE: factory does NOT pass --commit-each-task/--push-each-task.
+        # Committing and pushing is owned by factory's progress loop (a single
+        # writer that also VERIFIES the push landed), rather than by printer
+        # inside the detached exec where a failure is invisible. This is what
+        # makes "task complete" imply "commit is on GitHub".
         state = self._state_dir()
         state.mkdir(parents=True, exist_ok=True)
         self._exit_file().unlink(missing_ok=True)

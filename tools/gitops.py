@@ -182,6 +182,34 @@ class Git:
             return False
         return True
 
+    def unpushed(self, branch: str) -> int:
+        """Commits on local HEAD not yet on `origin/<branch>`. 0 means the
+        remote is up to date with HEAD (a push fully landed). -1 if it can't
+        be determined (e.g. the remote-tracking ref doesn't exist yet). Call
+        AFTER push: a successful `push -u` advances the local `origin/<branch>`
+        ref, so 0 confirms GitHub actually has the commits."""
+        if self.cfg.dry_run:
+            return 0
+        ref = f"origin/{branch}"
+        if not self._git(["rev-parse", "--verify", "--quiet", ref]).ok:
+            return -1
+        res = self._git(["rev-list", "--count", f"{ref}..HEAD"])
+        try:
+            return int(res.out.strip()) if res.ok else -1
+        except ValueError:
+            return -1
+
+    def commits_beyond(self, base_ref: str) -> int:
+        """Number of commits on HEAD beyond `base_ref` (e.g. the spec commit
+        plus each implementation commit). -1 if it can't be determined."""
+        if not self._git(["rev-parse", "--verify", "--quiet", base_ref]).ok:
+            return -1
+        res = self._git(["rev-list", "--count", f"{base_ref}..HEAD"])
+        try:
+            return int(res.out.strip()) if res.ok else -1
+        except ValueError:
+            return -1
+
     def has_uncommitted(self) -> bool:
         return bool(self._git(["status", "--porcelain"]).out.strip())
 
