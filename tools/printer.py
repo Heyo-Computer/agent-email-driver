@@ -19,12 +19,22 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from util import Result, log
+
+# Returned by `_wait` when an exec stalled and auto-nudges couldn't clear it.
+_STALLED = object()
+
+# Printer's non-TTY heartbeat line. It's emitted every ~10s from printer's own
+# process even while the child agent is wedged, so it is NOT evidence of
+# progress — real activity is any other `[agent]`/`[printer]` line, or a task
+# transition.
+_HEARTBEAT = "still working"
 
 # Scaffold lines like `--- stdout ---` that carry no diagnostic content.
 _SECTION_HEADER = re.compile(r"^-{2,}[^-]*-{2,}$")
@@ -72,6 +82,9 @@ class ExecOutcome:
     # Failure looks provider-transient (credits/rate limit/overload): the
     # item should be paused and retried, not reported as terminally failed.
     transient: bool = False
+    # The exec wedged and automatic nudges could not clear it: pause and
+    # retry fresh later, like a transient failure.
+    stalled: bool = False
 
 
 class Printer:
@@ -91,7 +104,7 @@ class Printer:
     POLL_SECS = 5
 
     def exec_spec(self, spec_path: Path, *, resume: bool = False,
-                  on_progress=None, stop_check=None) -> ExecOutcome:
+                  on_progress=None, stop_check=None, on_nudge=None) -> ExecOutcome:
         """Run `printer exec` for a spec, detached. Blocks until it finishes
         (no wall-clock timeout), but the exec itself survives factory dying:
         on a later call for the same tree we re-attach to the live process or
@@ -101,7 +114,9 @@ class Printer:
         tasks newly transition to done while we wait, so the pipeline can
         surface progress to the requester. `stop_check()` returning True ends
         the wait promptly with an `interrupted` outcome — the detached exec
-        keeps running and a later call re-attaches."""
+        keeps running and a later call re-attaches. `on_nudge(reason, manual)`
+        fires when a wedged exec is nudged (killed + resumed from checkpoint),
+        either automatically after a stall or on a manual request."""
         cfg = self.cfg
         rel = self._rel(spec_path)
         if cfg.dry_run:
@@ -121,8 +136,8 @@ class Printer:
         else:
             self._spawn(spec_path, resume=resume)
 
-        code = self._wait(on_progress=on_progress, reported=reported,
-                          stop_check=stop_check)
+        code = self._wait(spec_path, on_progress=on_progress, reported=reported,
+                          stop_check=stop_check, on_nudge=on_nudge)
         phase = self._phase(spec_path)
         if code is None:
             log.info("shutdown requested; leaving detached exec running for %s",
@@ -131,6 +146,12 @@ class Printer:
                                "factory shutdown requested; detached exec "
                                "continues and will be re-attached on restart",
                                phase, interrupted=True)
+        if code is _STALLED:
+            log.warning("printer exec stalled past nudge limit for %s", rel)
+            return ExecOutcome(False,
+                               "exec stalled (no progress); automatic nudges "
+                               "did not recover it — will retry fresh later",
+                               phase, stalled=True)
         self._cleanup_state()
         if code == 0:
             log.info("printer exec succeeded for %s", rel)
@@ -163,6 +184,21 @@ class Printer:
         working tree belongs to the agent — callers must not mutate it (no
         banking commits, base merges, or spec rewrites)."""
         return self._exit_file().is_file() or self._live_pid() is not None
+
+    def request_nudge(self) -> bool:
+        """Ask a running detached exec in this tree to nudge itself (kill +
+        resume from checkpoint). Cross-thread safe: the flag is a file the
+        wait loop polls. Returns False when no exec is active to nudge."""
+        if self._live_pid() is None:
+            return False
+        try:
+            self._state_dir().mkdir(parents=True, exist_ok=True)
+            self._nudge_file().write_text("1")
+            log.info("manual nudge requested for %s", self.repo)
+            return True
+        except OSError as e:  # noqa: BLE001
+            log.error("could not write nudge request: %s", e)
+            return False
 
     def _spawn(self, spec_path: Path, *, resume: bool) -> None:
         cfg = self.cfg
@@ -220,12 +256,22 @@ class Printer:
             pass  # exists but owned elsewhere — treat as alive
         return pid
 
-    def _wait(self, on_progress=None, reported: set[str] | None = None,
-              stop_check=None) -> int | None:
-        """Block until the detached exec finishes; return its exit code, or
-        None when `stop_check()` asks us to stop waiting (exec keeps running).
-        Fires `on_progress` for tasks that transition to done while waiting."""
+    def _wait(self, spec_path: Path, on_progress=None,
+              reported: set[str] | None = None, stop_check=None,
+              on_nudge=None):
+        """Block until the detached exec finishes. Returns its exit code, or
+        None when `stop_check()` asks us to stop (exec keeps running), or the
+        `_STALLED` sentinel when the exec wedged and auto-nudges couldn't clear
+        it. Fires `on_progress` for done-transitions and `on_nudge` when a
+        wedged exec is kicked."""
         reported = set(reported or ())
+        stall_timeout = getattr(self.cfg, "stall_timeout", 0)
+        max_nudges = getattr(self.cfg, "max_nudges", 0)
+        auto_nudges = 0
+        # Measure activity only from now on: a re-attached exec's log history
+        # is not evidence of current liveness.
+        self._log_offset = self._log_size()
+        last_activity = time.monotonic()
         while True:
             if self._exit_file().is_file():
                 try:
@@ -235,26 +281,131 @@ class Printer:
             if stop_check and stop_check():
                 return None
             if self._live_pid() is None:
-                # Re-check: it may have written the exit file and exited
-                # between the two checks above.
                 if self._exit_file().is_file():
                     continue
-                # Died without writing an exit code (SIGKILL/OOM of the
-                # wrapper itself). Printer's checkpoint still allows resume.
                 log.warning("detached printer exec disappeared without an "
                             "exit code")
                 return 1
-            if on_progress:
-                done_ids, total, titles = self._task_progress()
-                new = done_ids - reported
-                if new:
-                    reported |= new
+
+            active = False
+            done_ids, total, titles = self._task_progress()
+            new = done_ids - reported
+            if new:
+                active = True
+                reported |= new
+                if on_progress:
                     try:
                         on_progress(sorted(titles.get(i, i) for i in new),
                                     len(done_ids), total)
-                    except Exception as e:  # noqa: BLE001 - progress is best-effort
+                    except Exception as e:  # noqa: BLE001 - best-effort
                         log.error("progress callback failed: %s", e)
+            if self._log_advanced():
+                active = True
+            if active:
+                last_activity = time.monotonic()
+
+            # Manual nudge takes priority and doesn't consume the auto budget.
+            manual = self._nudge_file().is_file()
+            if manual:
+                self._nudge_file().unlink(missing_ok=True)
+            stalled = (stall_timeout and not manual
+                       and time.monotonic() - last_activity > stall_timeout)
+
+            if manual or stalled:
+                if stalled and auto_nudges >= max_nudges:
+                    # Give up: kill the wedged exec and clear its state so the
+                    # later retry spawns fresh (--continue from checkpoint)
+                    # instead of re-attaching to the same dead process.
+                    pid = self._live_pid()
+                    if pid is not None:
+                        self._kill_group(pid)
+                    self._cleanup_state()
+                    return _STALLED
+                secs = int(time.monotonic() - last_activity)
+                reason = ("manual request" if manual
+                          else f"no progress for {secs}s")
+                log.warning("nudging wedged exec (%s): killing and resuming "
+                            "from checkpoint", reason)
+                self._nudge(spec_path)
+                if stalled:
+                    auto_nudges += 1
+                last_activity = time.monotonic()
+                self._log_offset = self._log_size()
+                if on_nudge:
+                    try:
+                        on_nudge(reason, manual)
+                    except Exception as e:  # noqa: BLE001 - best-effort
+                        log.error("nudge callback failed: %s", e)
             time.sleep(self.POLL_SECS)
+
+    # --- stall detection + nudge ------------------------------------------------
+
+    def _nudge_file(self) -> Path:
+        """Presence requests a manual nudge; the wait loop consumes it."""
+        return self._state_dir() / "nudge.request"
+
+    def _log_size(self) -> int:
+        try:
+            return self._log_file().stat().st_size
+        except OSError:
+            return 0
+
+    def _log_advanced(self) -> bool:
+        """True if the log gained any NON-heartbeat line since the last check
+        (advancing the read offset). Heartbeat lines are excluded — printer
+        emits them even while the child agent is wedged, so they are not
+        progress. Only new bytes are read, so this stays cheap on long runs."""
+        path = self._log_file()
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return False
+        if size < self._log_offset:   # truncated/rotated
+            self._log_offset = 0
+        if size <= self._log_offset:
+            return False
+        try:
+            with path.open("r", errors="replace") as fh:
+                fh.seek(self._log_offset)
+                chunk = fh.read()
+                self._log_offset = fh.tell()
+        except OSError:
+            return False
+        return any(line.strip() and _HEARTBEAT not in line
+                   for line in chunk.splitlines())
+
+    def _nudge(self, spec_path: Path) -> None:
+        """Kill the wedged detached exec (whole process group) and re-spawn it
+        with --continue. Printer resumes from its checkpoint; per-task commits
+        already pushed are preserved."""
+        pid = self._live_pid()
+        if pid is not None:
+            self._kill_group(pid)
+        self._cleanup_state()
+        self._spawn(spec_path, resume=True)
+
+    def _kill_group(self, pid: int) -> None:
+        """SIGTERM then SIGKILL the process group led by the detached wrapper
+        (spawned with start_new_session, so pid is the group leader — this
+        reaps the sh wrapper, printer, and the agent subtree)."""
+        try:
+            pgid = os.getpgid(pid)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            return
+        for _ in range(30):  # up to ~3s for graceful exit
+            time.sleep(0.1)
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     def _task_progress(self) -> tuple[set[str], int, dict[str, str]]:
         """Read printer's task store: (done ids, total tasks, id -> title).

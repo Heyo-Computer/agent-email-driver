@@ -87,6 +87,16 @@ class Config:
     # immediately regardless.
     retry_delay: int
 
+    # Nudge a wedged exec (kill + resume from checkpoint) when it makes no
+    # real progress for this many seconds. 0 disables auto-nudging.
+    stall_timeout: int
+    # Max automatic nudges within a single wait before giving up (the item is
+    # then paused for a later fresh retry).
+    max_nudges: int
+    # Email subject/body markers that, on a reply threaded to an in-flight
+    # item, trigger a manual nudge instead of a new work item.
+    imap_nudge_markers: list[str]
+
     # Linear (via the Linear MCP server, reached through `claude -p`)
     linear_team: str
     linear_trigger_state: str
@@ -162,6 +172,9 @@ class Config:
             resume_max_attempts=int(_env("FACTORY_RESUME_MAX_ATTEMPTS", "3")),
             max_concurrent=int(_env("FACTORY_MAX_CONCURRENT", "3")),
             retry_delay=int(_env("FACTORY_RETRY_DELAY", "900")),
+            stall_timeout=int(_env("FACTORY_STALL_TIMEOUT", "1800")),
+            max_nudges=int(_env("FACTORY_MAX_NUDGES", "3")),
+            imap_nudge_markers=_csv("FACTORY_IMAP_NUDGE_MARKERS") or ["nudge"],
             linear_team=_env("FACTORY_LINEAR_TEAM", ""),
             linear_trigger_state=_env("FACTORY_LINEAR_TRIGGER_STATE", "Todo"),
             linear_inprogress_state=_env(

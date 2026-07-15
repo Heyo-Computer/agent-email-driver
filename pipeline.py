@@ -145,6 +145,7 @@ class Pipeline:
             spec_path,
             on_progress=self._progress_cb(item, pr, git, branch),
             stop_check=self.stop_check,
+            on_nudge=self._nudge_cb(item, pr, git, branch),
         )
 
         if outcome.interrupted:
@@ -168,12 +169,16 @@ class Pipeline:
         git.push(branch)
 
         if not outcome.success:
-            if outcome.transient and self.journal:
-                # Provider said "not right now" (credits/rate limit/overload).
-                # This is a pause, not a failure: keep the journal entry and
+            if (outcome.transient or outcome.stalled) and self.journal:
+                # Not a real failure: either the provider said "not right now"
+                # (credits/rate limit/overload), or the exec wedged and
+                # auto-nudges couldn't clear it. Keep the journal entry and
                 # worktree, schedule a retry, and say so — the exec resumes
                 # from printer's checkpoint with all completed tasks intact.
-                self._pause(item, pr, outcome.reason)
+                cause = ("a stall that automatic nudges could not clear"
+                         if outcome.stalled
+                         else "a temporary provider limit")
+                self._pause(item, pr, outcome.reason, cause=cause)
                 return
             self._fail(item, pr, outcome.reason)
             return
@@ -306,29 +311,62 @@ class Pipeline:
         self._notify_owner(item, f"factory done: {item.title}", msg)
         log.info("=== done %s '%s' -> %s", item.source, item.title, pr)
 
-    def _pause(self, item: WorkItem, pr: str, reason: str) -> None:
-        """Transient-failure pause: defer the journaled item for retry and
-        notify on the first pause only (a long credit outage must not send an
-        email every retry cycle, but going quiet forever is how the agent
-        looks dead — so every 20th deferral re-notifies)."""
+    def _pause(self, item: WorkItem, pr: str, reason: str, *,
+               cause: str = "a temporary provider limit") -> None:
+        """Deferred-retry pause (transient provider failure, or an unclearable
+        stall): defer the journaled item for retry and notify on the first
+        pause only (a long outage must not send an email every retry cycle,
+        but going quiet forever is how the agent looks dead — so every 20th
+        deferral re-notifies)."""
         delay = self.cfg.retry_delay
         n = self.journal.defer(item, delay)
         log.warning("PAUSED %s '%s' (deferral %d, retry in %ds): %s",
                     item.source, item.title, n, delay, reason)
         if n == 1 or n % 20 == 0:
             body = (
-                f"factory hit a temporary provider limit and paused this "
-                f"item:\n\n  {reason}\n\n"
+                f"factory paused this item after hitting {cause}:\n\n"
+                f"  {reason}\n\n"
                 f"Completed work is committed and pushed to the draft PR:\n"
                 f"{pr}\n\n"
                 f"It will retry automatically about every "
                 f"{delay // 60} minutes (restarting factory retries "
-                f"immediately). No action needed unless this is a billing "
-                f"issue on the account.\n"
+                f"immediately).\n"
             )
             if item.source == "email" and item.reply_to:
                 self._reply(item, body, to=item.reply_to)
             self._notify_owner(item, f"factory paused: {item.title}", body)
+
+    def _nudge_cb(self, item: WorkItem, pr: str, git, branch: str):
+        """Reporter fired when a wedged exec is nudged (killed + resumed from
+        checkpoint). Pushes committed progress and tells the requester the run
+        was stuck and has been restarted — so a stall reads as 'kicked', not
+        'dead'. Best-effort; never raises into the wait loop."""
+        def cb(reason: str, manual: bool) -> None:
+            kind = "at your request" if manual else f"automatically ({reason})"
+            git.push(branch)
+            body = (
+                f"factory found this run stuck and nudged it {kind}: the "
+                f"agent was killed and resumed from its last checkpoint, so "
+                f"completed tasks are kept and it picks up where it left "
+                f"off.\n\nDraft PR:\n{pr}\n"
+            )
+            log.info("nudged '%s' (%s)", item.title, reason)
+            if item.source == "email" and item.reply_to:
+                self._reply(item, body, to=item.reply_to)
+            elif item.source == "linear":
+                self.linear.comment(item.identifier or item.ref,
+                                    f"👋 nudged a stuck run ({reason}); resumed "
+                                    f"from checkpoint")
+            self._notify_owner(item, f"factory nudged: {item.title}", body)
+        return cb
+
+    def request_nudge(self, item: WorkItem) -> bool:
+        """Signal a running exec for `item` to nudge itself. Returns False if
+        the item has no active worktree/exec to nudge."""
+        wt = self._worktree(item)
+        if not wt.exists():
+            return False
+        return self.printer.for_repo(wt).request_nudge()
 
     def _fail(self, item: WorkItem, pr: str | None, reason: str) -> None:
         # Reported failures are terminal: the requester is told, so a restart

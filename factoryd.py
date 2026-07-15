@@ -161,6 +161,10 @@ class Factory:
         if self.cfg.imap_enabled:
             try:
                 for t in self.inbox.fetch_triggers():
+                    # A reply threaded to an in-flight item that says "nudge"
+                    # kicks that run rather than starting a new one.
+                    if self._maybe_nudge(t):
+                        continue
                     target, title = self._classify_target(t.subject)
                     items.append(
                         WorkItem(
@@ -178,6 +182,44 @@ class Factory:
             except Exception as e:  # noqa: BLE001
                 log.exception("error polling inbox: %s", e)
         return items
+
+    def _maybe_nudge(self, trigger) -> bool:
+        """If `trigger` is a nudge (contains a nudge marker AND threads to a
+        currently in-flight journaled item), kick that run and consume the
+        email. Returns True when handled. A brand-new email mentioning "nudge"
+        won't match any thread, so it flows through as normal work."""
+        from tools.inbox import _has_directive, _msgids
+        if not _has_directive(trigger.subject, trigger.body,
+                              self.cfg.imap_nudge_markers):
+            return False
+        refs = set(_msgids(trigger.references))
+        target = None
+        for item_dict, _meta in self.journal.pending():
+            mid = item_dict.get("reply_msgid")
+            if mid and mid in refs:
+                target = self._item_from_dict(item_dict)
+                break
+        if target is None:
+            return False
+        self.inbox.mark_seen(trigger.uid)
+        ok = self.pipeline.request_nudge(target)
+        log.info("nudge reply for '%s': %s", target.title,
+                 "signalled" if ok else "no active run")
+        body = (
+            f"Got your nudge. The run was kicked — it will restart from its "
+            f"last checkpoint and keep going.\n"
+            if ok else
+            f"Got your nudge, but there's no active run to kick right now "
+            f"(it may be paused or already finished). If it's paused it will "
+            f"retry on its own.\n"
+        )
+        if trigger.sender:
+            self.notifier.send(
+                f"Re: {trigger.subject}", body, to=trigger.sender,
+                in_reply_to=trigger.message_id or None,
+                references=trigger.references or None,
+            )
+        return True
 
     def resume_pending(self) -> None:
         """Re-queue work interrupted by a crash/restart (journal leftovers).
