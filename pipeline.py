@@ -491,9 +491,17 @@ class Pipeline:
         self._notify_owner(item, f"factory needs a decision: {item.title}", body)
 
     def apply_answer(self, item: WorkItem, answer: str, question: str = "") -> bool:
-        """Inject an owner's answer into the worktree spec and commit it, so a
-        subsequent resume feeds it to the agent. Returns False if the worktree
-        is gone (nothing to resume)."""
+        """Deliver an owner's answer so the resumed agent actually internalizes
+        it. Two channels, because the spec alone wasn't enough (the agent
+        re-evaluates the task store on resume and re-blocks on the same task):
+
+        1. Record the decision as an authoritative comment on each blocked task
+           and UNBLOCK it (`printer task comment`/`unblock`) — the task store is
+           what drives the agent's loop, so this is what stops the re-ask.
+        2. Append it to the spec too, for narrative context and audit, with an
+           explicit 'do not re-block on this' instruction.
+
+        Returns False if the worktree is gone (nothing to resume)."""
         wt = self._worktree(item)
         if not wt.exists():
             return False
@@ -501,12 +509,27 @@ class Pipeline:
         spec_path = wt / self.cfg.specs_dir / f"{stem}.md"
         if not spec_path.is_file():
             return False
+
+        # 1. Wire the decision onto the blocked tasks + unblock them.
+        printer = self.printer.for_repo(wt)
+        updated = printer.record_answer(answer, question)
+
+        # 2. Spec appendix.
+        if updated:
+            follow = (
+                f"This decision is recorded as an OWNER DECISION comment on "
+                f"task(s) {', '.join(updated)}, now unblocked. Act on it: "
+                f"implement the decision, or if it means deferring/skipping the "
+                f"work, mark the task done or cancelled with a note. Do NOT "
+                f"re-block on this same question — only block again if you hit a "
+                f"genuinely different decision you cannot make.\n")
+        else:
+            follow = ("Incorporate this decision and continue; do not re-block "
+                      "on the same question.\n")
         section = (
             "\n\n---\n\n## Owner decision (resolves a blocker)\n\n"
             + (f"**Question:** {question}\n\n" if question else "")
-            + f"**Answer:** {answer.strip()}\n\n"
-            "Incorporate this decision and continue. Un-block any task that was "
-            "waiting on it (`printer task start <id>`), then proceed.\n"
+            + f"**Answer:** {answer.strip()}\n\n" + follow
         )
         try:
             with spec_path.open("a") as fh:
@@ -519,7 +542,8 @@ class Pipeline:
         rel = f"{self.cfg.specs_dir}/{spec_path.name}"
         git.commit_paths([rel], f"factory: owner answer for {item.title}")
         git.push(_branch)
-        log.info("applied owner answer to '%s'", item.title)
+        log.info("applied owner answer to '%s' (tasks updated: %s)",
+                 item.title, ", ".join(updated) or "none")
         return True
 
     def _nudge_cb(self, item: WorkItem, pr: str, git, branch: str):

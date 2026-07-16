@@ -23,9 +23,10 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
-from util import Result, log
+from util import Result, log, run
 
 # Returned by `_wait` when an exec stalled and auto-nudges couldn't clear it.
 _STALLED = object()
@@ -199,14 +200,14 @@ class Printer:
         return (detail or reason
                 or "the agent reported blocked but gave no reason")[:2500]
 
-    def _blocked_context(self) -> str:
-        """Structured, agent-authored context for the block: each `blocked`
-        task's id/title, its blocked_reason, and its comment body from the
-        task store. Clean markdown the owner can actually act on."""
-        tasks_dir = Path(self.repo) / ".printer" / "tasks"
+    def _tasks_dir(self) -> Path:
+        return Path(self.repo) / ".printer" / "tasks"
+
+    def _iter_blocked(self):
+        """Yield (id, title, blocked_reason, body) for each `blocked` task."""
+        tasks_dir = self._tasks_dir()
         if not tasks_dir.is_dir():
-            return ""
-        blocks: list[str] = []
+            return
         for f in sorted(tasks_dir.glob("*.md")):
             fields: dict[str, str] = {}
             body_lines: list[str] = []
@@ -227,19 +228,55 @@ class Printer:
                     body_lines.append(line)
             if fields.get("status") != "blocked":
                 continue
-            tid, title = fields.get("id", ""), fields.get("title", "")
+            yield (fields.get("id", ""), fields.get("title", ""),
+                   fields.get("blocked_reason", ""),
+                   "\n".join(body_lines).strip())
+
+    def _blocked_context(self) -> str:
+        """Structured, agent-authored context for the block: each `blocked`
+        task's id/title, its blocked_reason, and its comment body from the
+        task store. Clean markdown the owner can actually act on."""
+        blocks: list[str] = []
+        for tid, title, reason, body in self._iter_blocked():
             head = " — ".join(p for p in (tid, title) if p) or "(task)"
             parts = [f"■ {head}"]
-            reason = fields.get("blocked_reason", "")
             if reason:
                 parts.append(f"  needs: {reason}")
-            body = "\n".join(body_lines).strip()
             if body:
-                # The agent's own notes/comments — the richest context.
                 parts.extend(f"  {bl}" for bl in body.splitlines()[:20]
                              if bl.strip())
             blocks.append("\n".join(parts))
         return "\n\n".join(blocks)
+
+    def blocked_task_ids(self) -> list[str]:
+        return [tid for tid, _t, _r, _b in self._iter_blocked() if tid]
+
+    def _task_cmd(self, args: list[str]) -> bool:
+        res = run([self.cfg.printer_bin, "task", *args,
+                   "--tasks-dir", str(self._tasks_dir())], cwd=self.repo)
+        if not res.ok:
+            log.warning("printer task %s failed: %s", args[0],
+                        (res.err or res.out).strip())
+        return res.ok
+
+    def record_answer(self, answer: str, question: str = "") -> list[str]:
+        """Attach the owner's decision to every blocked task as an authoritative
+        comment and UNBLOCK it, so the resumed agent acts on the decision from
+        the task store instead of re-encountering a blocked task and re-asking.
+        Returns the task ids updated (empty if none blocked)."""
+        ids = self.blocked_task_ids()
+        if not ids:
+            return []
+        note = (f"OWNER DECISION ({date.today().isoformat()}) — authoritative, "
+                f"do NOT re-block on this: {answer.strip()}")
+        done = []
+        for tid in ids:
+            self._task_cmd(["comment", tid, note])
+            if self._task_cmd(["unblock", tid]):
+                done.append(tid)
+        log.info("recorded owner answer on blocked task(s): %s",
+                 ", ".join(done) or "none")
+        return done
 
     # --- detached process management --------------------------------------------
 
