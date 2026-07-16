@@ -462,17 +462,23 @@ class Pipeline:
         and worktree (resumable), surfaces the question on the PR and in-thread,
         and does NOT mark ready or auto-retry."""
         self.journal.block_on_answer(item, pr, question)
+        headline = question.splitlines()[0] if question else question
         log.warning("BLOCKED %s '%s' awaiting owner answer: %s",
-                    item.source, item.title, question)
+                    item.source, item.title, headline)
+        # Render the (possibly multi-line) question as a markdown blockquote on
+        # the PR, and as an indented block in the email.
+        quoted_md = "\n".join(f"> {ln}" for ln in question.splitlines())
+        quoted_txt = "\n".join(f"    {ln}" for ln in question.splitlines())
         self.gh.comment(
             pr,
-            f"⏸️ **factory needs a decision to continue**\n\n> {question}\n\n"
+            f"⏸️ **factory needs a decision to continue**\n\n{quoted_md}\n\n"
             f"Reply to the factory email thread, or comment here with your "
             f"answer, and factory will feed it back to the agent and resume "
             f"from where it stopped.")
         body = (
             f"The agent stopped and needs a decision from you before it can "
-            f"continue:\n\n  {question}\n\n"
+            f"continue. Here is what it's asking:\n\n"
+            f"{quoted_txt}\n\n"
             f"Reply to this email with your answer (or comment on the PR) and "
             f"factory will resume from where it left off — completed work is "
             f"kept. Draft PR:\n{pr}\n"
@@ -481,7 +487,7 @@ class Pipeline:
             self._reply(item, body, to=item.reply_to)
         elif item.source == "linear":
             self.linear.comment(item.identifier or item.ref,
-                                f"⏸️ needs a decision to continue: {question}")
+                                f"⏸️ needs a decision to continue:\n\n{quoted_md}")
         self._notify_owner(item, f"factory needs a decision: {item.title}", body)
 
     def apply_answer(self, item: WorkItem, answer: str, question: str = "") -> bool:

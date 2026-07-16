@@ -165,9 +165,12 @@ class Printer:
         res = Result(code, "", tail)
         reason = self._classify(res, phase)
         transient = bool(_TRANSIENT.search(tail))
-        question = self._blocked_question(tail)
+        # Read a larger window for the block: the agent's full explanation is
+        # printed just before the one-line sentinel.
+        question = self._blocked_question(self._log_tail(200))
         if question:
-            log.warning("printer exec blocked for %s: %s", rel, question)
+            log.warning("printer exec blocked for %s: %s", rel,
+                        question.splitlines()[0] if question else "")
             return ExecOutcome(False, reason, phase, blocked=True,
                                question=question)
         log.warning("printer exec failed for %s%s: %s", rel,
@@ -175,19 +178,51 @@ class Printer:
         return ExecOutcome(False, reason, phase, transient=transient)
 
     def _blocked_question(self, tail: str) -> str:
-        """Extract the agent's blocking question from the output, or "" if the
-        exec didn't end blocked. Printer prints `<<BLOCKED: reason>>`; the
-        reason is the decision the owner needs to make."""
-        if "<<BLOCKED" not in tail:
+        """Build the decision request from the block. Returns "" if the exec
+        didn't end blocked. Printer's `<<BLOCKED: reason>>` sentinel is only a
+        one-liner; the agent's fuller explanation (options, tradeoffs, what it
+        needs) is the prose printed just before it. We surface both: the
+        one-line reason as the headline plus that surrounding explanation, so
+        the owner can actually answer."""
+        idx = tail.rfind("<<BLOCKED")
+        if idx == -1:
             return ""
-        # Prefer the sentinel payload; fall back to the last BLOCK-ish line.
-        m = re.search(r"<<BLOCKED:\s*(.*?)>>", tail, re.S)
-        if m and m.group(1).strip():
-            return " ".join(m.group(1).split())[:800]
-        for line in reversed([ln.strip() for ln in tail.splitlines() if ln.strip()]):
-            if "BLOCK" in line.upper():
-                return line[:800]
-        return "the agent reported blocked but gave no reason"
+        m = re.search(r"<<BLOCKED:\s*(.*?)>>", tail[idx:], re.S)
+        reason = " ".join(m.group(1).split()) if m and m.group(1).strip() else ""
+
+        # The agent's explanation: prose lines right before the sentinel, with
+        # printer scaffolding (heartbeats, [printer] lines, section headers,
+        # the wrapper error) stripped and the `[agent] ` prefix removed.
+        context: list[str] = []
+        for ln in reversed(tail[:idx].splitlines()):
+            s = ln.strip()
+            # Strip the stream prefix whether or not the line has content, so a
+            # bare `[agent]` (the agent's own blank line) becomes a paragraph
+            # break rather than literal noise.
+            if s.startswith("[agent]"):
+                s = s[len("[agent]"):].strip()
+            if not s:
+                if context and context[-1] != "":
+                    context.append("")   # preserve paragraph breaks
+                continue
+            low = s.lower()
+            if (_HEARTBEAT in s or s.startswith("[printer]")
+                    or _SECTION_HEADER.match(s) or low.startswith("error:")
+                    or "exited with status" in low):
+                continue
+            # Drop the sentinel line itself from the context (it's the headline).
+            if "<<BLOCKED" in s:
+                continue
+            context.append(s)
+            if len(context) >= 40:
+                break
+        context.reverse()
+        detail = "\n".join(context).strip()
+
+        if reason and detail and reason not in detail:
+            return f"{reason}\n\n{detail}"[:2500]
+        return (detail or reason
+                or "the agent reported blocked but gave no reason")[:2500]
 
     # --- detached process management --------------------------------------------
 
