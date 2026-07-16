@@ -54,11 +54,11 @@ class Git:
         if self.local_branch_exists(branch):
             if not self._git(["switch", branch]).ok:
                 return False
-            return self.merge_base(branch)
+            return self._legacy_merge(branch)
         if self.remote_branch_exists(branch):
             if not self._git(["switch", "--track", f"origin/{branch}"]).ok:
                 return False
-            return self.merge_base(branch)
+            return self._legacy_merge(branch)
         base = self.cfg.base_branch
         start = f"origin/{base}"
         if not self._git(["rev-parse", "--verify", "--quiet", start]).ok:
@@ -144,20 +144,49 @@ class Git:
             self._git(["worktree", "prune"])
         return not path.exists()
 
-    def merge_base(self, branch: str) -> bool:
+    def _legacy_merge(self, branch: str) -> bool:
+        """merge_base for the non-worktree flow, which has no agent to hand a
+        conflict to: a conflict is aborted and reported as failure."""
+        status = self.merge_base(branch)
+        if status == "conflict":
+            self._git(["merge", "--abort"])
+            log.error("merge conflict on %s (non-worktree flow); aborted", branch)
+            return False
+        return status != "error"
+
+    def has_conflicts(self) -> bool:
+        """True when the index has unmerged paths (an in-progress merge with
+        unresolved conflicts)."""
+        return bool(self._git(["ls-files", "--unmerged"]).out.strip())
+
+    def merge_base(self, branch: str) -> str:
         """Fold the latest origin/<base> into a reused branch so resumed work
-        starts from current base, not wherever the branch was originally cut.
-        A conflict aborts the merge and fails branch preparation."""
+        starts from current base. Returns a status the caller acts on:
+
+        - "ok":       merged cleanly, or nothing to merge.
+        - "conflict": the merge conflicted and is LEFT IN PROGRESS in the
+          worktree (markers + MERGE_HEAD) for the agent to resolve — factory
+          no longer aborts+fails a whole item over a conflict.
+        - "error":    the merge could not run; aborted to a clean state so work
+          can still proceed on the existing base (a stale base is non-fatal —
+          the PR diff handles it).
+        """
+        if self.cfg.dry_run:
+            return "ok"
         base_ref = f"origin/{self.cfg.base_branch}"
         if not self._git(["rev-parse", "--verify", "--quiet", base_ref]).ok:
-            return True
+            return "ok"
         res = self._git(["merge", "--no-edit", base_ref])
-        if not res.ok:
-            self._git(["merge", "--abort"])
-            log.error("could not merge %s into %s: %s", base_ref, branch,
-                      res.err.strip())
-            return False
-        return True
+        if res.ok:
+            return "ok"
+        if self.has_conflicts():
+            log.warning("merge of %s into %s conflicted; leaving it for the "
+                        "agent to resolve", base_ref, branch)
+            return "conflict"
+        self._git(["merge", "--abort"])
+        log.error("could not merge %s into %s (non-conflict): %s; proceeding "
+                  "on the existing base", base_ref, branch, res.err.strip())
+        return "error"
 
     def commit_paths(self, paths: list[str], message: str) -> bool:
         """Stage given paths and commit. No-op (returns True) if nothing staged."""
@@ -182,6 +211,12 @@ class Git:
         if self.cfg.dry_run:
             log.info("[dry-run] would commit all: %s", message)
             return True
+        if self.has_conflicts():
+            # `git add -A` would stage conflict markers as "resolved"; never
+            # commit an unresolved merge. Leave it for the agent to finish.
+            log.warning("unresolved merge conflicts present; not committing '%s'",
+                        message)
+            return False
         self._git(["add", "-A", "--", ".", ":(exclude).printer", ":(exclude).printer/**"])
         if self._git(["diff", "--cached", "--quiet"]).ok:
             return True

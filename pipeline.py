@@ -72,6 +72,33 @@ class Pipeline:
         except OSError as e:  # noqa: BLE001
             log.error("could not append memory to spec: %s", e)
 
+    def _append_conflict_instruction(self, spec_path: Path, branch: str) -> None:
+        """Tell the agent to resolve the in-progress base merge before anything
+        else. The worktree has an active merge (MERGE_HEAD + conflict markers);
+        the agent has full git/file tooling to resolve it."""
+        section = (
+            "\n\n---\n\n## FIRST: resolve the in-progress merge conflict\n\n"
+            f"This worktree has an in-progress merge of the latest "
+            f"`{self.cfg.base_branch}` into `{branch}` that stopped on "
+            "conflicts. Before doing any task work, resolve it:\n\n"
+            "1. Run `git status` to see the conflicted files.\n"
+            "2. Edit each one to resolve the `<<<<<<<`/`=======`/`>>>>>>>` "
+            "markers, keeping both the branch's intent and the incoming "
+            "changes from the base.\n"
+            "3. `git add` the resolved files and `git commit --no-edit` to "
+            "complete the merge.\n"
+            "4. Confirm `git status` is clean, then proceed with the tasks "
+            "below.\n\n"
+            "If a conflict genuinely needs an owner decision you cannot make, "
+            "emit the blocked sentinel with a clear question rather than "
+            "guessing.\n"
+        )
+        try:
+            with spec_path.open("a") as fh:
+                fh.write(section)
+        except OSError as e:  # noqa: BLE001
+            log.error("could not append conflict instruction to spec: %s", e)
+
     # --- orchestration ---------------------------------------------------------
 
     def process(self, item: WorkItem, *, resume: bool = False,
@@ -110,6 +137,7 @@ class Pipeline:
         # was down. While one is active the tree belongs to the agent: skip
         # anything that would mutate it and go straight to re-attach/collect.
         exec_active = resume and printer.exec_active()
+        merge_conflict = False
         if exec_active:
             log.info("live/finished detached exec found for '%s'; re-attaching",
                      item.title)
@@ -122,12 +150,10 @@ class Pipeline:
                     f"factory: recover in-progress work for {item.title}")
 
             # Reused branches start from wherever they were cut; fold in
-            # current base. (No-op for branches just created off origin/<base>.)
-            if not git.merge_base(branch):
-                self._fail(item, None,
-                           f"could not merge latest {self.cfg.base_branch} "
-                           f"into {branch}")
-                return
+            # current base. A conflict is NOT fatal: it's left in the tree for
+            # the agent to resolve as its first task. A non-conflict merge
+            # error is non-fatal too — proceed on the existing base.
+            merge_conflict = git.merge_base(branch) == "conflict"
 
         # 2. spec + commit + push. The spec is only generated once: on resume
         # the agent must keep working against the spec it started with (specgen
@@ -137,13 +163,22 @@ class Pipeline:
             self.specgen.write_spec(spec_path, title=item.title, body=item.body)
             if mem_index:
                 self._append_memory(spec_path, mem_index)
+        if merge_conflict:
+            self._append_conflict_instruction(spec_path, branch)
         rel_spec = f"{self.cfg.specs_dir}/{spec_path.name}"
-        if not git.commit_paths([rel_spec], f"factory: spec for {item.title}"):
-            self._fail(item, None, "could not commit spec")
-            return
-        if not git.push(branch):
-            self._fail(item, None, "could not push branch")
-            return
+        # With a merge in progress the tree has conflict markers — committing
+        # now would bake them in. Skip the spec commit/push and let the agent
+        # resolve the merge first; the appended instruction is read from the
+        # working tree and committed with the merge resolution. (A conflict
+        # only happens on a reused branch, whose spec + PR already exist.)
+        if not merge_conflict:
+            if not git.commit_paths([rel_spec],
+                                    f"factory: spec for {item.title}"):
+                self._fail(item, None, "could not commit spec")
+                return
+            if not git.push(branch):
+                self._fail(item, None, "could not push branch")
+                return
 
         # 3. draft PR
         pr_body = self._pr_body(item, rel_spec)
@@ -219,6 +254,21 @@ class Pipeline:
                 self._pause(item, pr, outcome.reason, cause=cause)
                 return
             self._fail(item, pr, outcome.reason)
+            return
+
+        # If the agent finished but left the base merge unresolved, the branch
+        # still has conflict markers — never present that as ready. Ask for a
+        # decision (resumable) rather than merging a broken tree.
+        if not self.cfg.dry_run and git.has_conflicts():
+            if self.journal:
+                self._await_answer(
+                    item, pr,
+                    f"The merge of the latest {self.cfg.base_branch} into this "
+                    f"branch has conflicts the agent could not resolve on its "
+                    f"own. Resolve the conflicts on the branch (or advise how), "
+                    f"then reply to resume.")
+            else:
+                self._fail(item, pr, "unresolved merge conflicts remain")
             return
 
         # A "successful" exec whose branch changes nothing beyond the spec
