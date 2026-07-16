@@ -179,50 +179,67 @@ class Printer:
 
     def _blocked_question(self, tail: str) -> str:
         """Build the decision request from the block. Returns "" if the exec
-        didn't end blocked. Printer's `<<BLOCKED: reason>>` sentinel is only a
-        one-liner; the agent's fuller explanation (options, tradeoffs, what it
-        needs) is the prose printed just before it. We surface both: the
-        one-line reason as the headline plus that surrounding explanation, so
-        the owner can actually answer."""
+        didn't end blocked.
+
+        Printer's `<<BLOCKED: reason>>` sentinel is only a one-liner. The rich,
+        agent-authored context lives in the TASK STORE — the agent records why
+        a task is blocked and what it needs via `printer task comment` / a
+        `blocked` status. We surface the one-line reason as the headline plus
+        those blocked-task details. (The exec log is NOT scraped for this: its
+        `[agent] ⚙ Bash(...)` lines are tool-call activity, not prose, and
+        reading them produces exactly the noise this replaces.)"""
         idx = tail.rfind("<<BLOCKED")
         if idx == -1:
             return ""
         m = re.search(r"<<BLOCKED:\s*(.*?)>>", tail[idx:], re.S)
         reason = " ".join(m.group(1).split()) if m and m.group(1).strip() else ""
-
-        # The agent's explanation: prose lines right before the sentinel, with
-        # printer scaffolding (heartbeats, [printer] lines, section headers,
-        # the wrapper error) stripped and the `[agent] ` prefix removed.
-        context: list[str] = []
-        for ln in reversed(tail[:idx].splitlines()):
-            s = ln.strip()
-            # Strip the stream prefix whether or not the line has content, so a
-            # bare `[agent]` (the agent's own blank line) becomes a paragraph
-            # break rather than literal noise.
-            if s.startswith("[agent]"):
-                s = s[len("[agent]"):].strip()
-            if not s:
-                if context and context[-1] != "":
-                    context.append("")   # preserve paragraph breaks
-                continue
-            low = s.lower()
-            if (_HEARTBEAT in s or s.startswith("[printer]")
-                    or _SECTION_HEADER.match(s) or low.startswith("error:")
-                    or "exited with status" in low):
-                continue
-            # Drop the sentinel line itself from the context (it's the headline).
-            if "<<BLOCKED" in s:
-                continue
-            context.append(s)
-            if len(context) >= 40:
-                break
-        context.reverse()
-        detail = "\n".join(context).strip()
-
-        if reason and detail and reason not in detail:
+        detail = self._blocked_context()
+        if reason and detail:
             return f"{reason}\n\n{detail}"[:2500]
         return (detail or reason
                 or "the agent reported blocked but gave no reason")[:2500]
+
+    def _blocked_context(self) -> str:
+        """Structured, agent-authored context for the block: each `blocked`
+        task's id/title, its blocked_reason, and its comment body from the
+        task store. Clean markdown the owner can actually act on."""
+        tasks_dir = Path(self.repo) / ".printer" / "tasks"
+        if not tasks_dir.is_dir():
+            return ""
+        blocks: list[str] = []
+        for f in sorted(tasks_dir.glob("*.md")):
+            fields: dict[str, str] = {}
+            body_lines: list[str] = []
+            fences = 0
+            try:
+                lines = f.read_text(errors="replace").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                if line.strip() == "+++":
+                    fences += 1
+                    continue
+                if fences == 1:
+                    fm = re.match(r'^(\w+)\s*=\s*(.*)$', line)
+                    if fm:
+                        fields[fm.group(1)] = fm.group(2).strip().strip('"').strip("'")
+                elif fences >= 2:
+                    body_lines.append(line)
+            if fields.get("status") != "blocked":
+                continue
+            tid, title = fields.get("id", ""), fields.get("title", "")
+            head = " — ".join(p for p in (tid, title) if p) or "(task)"
+            parts = [f"■ {head}"]
+            reason = fields.get("blocked_reason", "")
+            if reason:
+                parts.append(f"  needs: {reason}")
+            body = "\n".join(body_lines).strip()
+            if body:
+                # The agent's own notes/comments — the richest context.
+                parts.extend(f"  {bl}" for bl in body.splitlines()[:20]
+                             if bl.strip())
+            blocks.append("\n".join(parts))
+        return "\n\n".join(blocks)
 
     # --- detached process management --------------------------------------------
 
